@@ -114,6 +114,7 @@ def build_effective_args(config):
     args.tasks = list(config['tasks'])
     args.full_data.root_path = config['data_root']
     args.use_partial_data = False
+    args.data = copy.deepcopy(args.full_data)
     args.train_sample_limits = copy.deepcopy(config['train_sample_limits'])
     args.subset_seed = int(config['subset_seed'])
     args.epochs = int(config['epochs'])

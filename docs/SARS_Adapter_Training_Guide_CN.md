@@ -52,6 +52,7 @@
 - `seed`：模型和训练主随机种子。
 
 每次真实训练都会在 checkpoint 旁保存 `effective_config.yaml` 和 `training_subset_manifest.json`。
+其中 `effective_config.yaml` 会显式保存已经解析的 `data` 配置，保证 checkpoint 可以脱离训练过程中的临时变量重新加载。
 
 ## 推荐执行顺序
 
@@ -76,3 +77,5 @@
 ```
 
 只有在一轮 smoke test 获得本机实际耗时和安全 batch size 后，才能启动 120 epochs 正式训练。
+
+一轮 epoch 的 smoke checkpoint 只用于证明运行环境和训练闭环有效，不能用于报告正式补全精度。

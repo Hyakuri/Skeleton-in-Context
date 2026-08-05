@@ -65,6 +65,7 @@ class TrainingConfigTest(unittest.TestCase):
         self.assertEqual(list(args.tasks), OFFICIAL_TASKS)
         self.assertEqual(args.train_sample_limits['MC'], 4)
         self.assertEqual(args.num_workers, 0)
+        self.assertEqual(args.data.root_path, root)
 
     def test_rejects_task_removal(self):
         with tempfile.TemporaryDirectory() as root:

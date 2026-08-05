@@ -52,6 +52,7 @@ Edit `build_direct_run_config()` in `sars_adapter/train_subset.py`:
 - `seed`: model and training random seed.
 
 Every real run saves `effective_config.yaml` and `training_subset_manifest.json` beside the checkpoint.
+The effective configuration also materializes the resolved `data` section so that the checkpoint can be reloaded without relying on training-time mutation.
 
 ## Recommended Sequence
 
@@ -76,3 +77,5 @@ To run the upstream evaluation after training:
 ```
 
 Formal 120-epoch training should start only after the one-epoch smoke run establishes the local runtime and a safe batch size.
+
+The one-epoch smoke checkpoint validates the runtime only. It is not suitable for reporting final completion accuracy.

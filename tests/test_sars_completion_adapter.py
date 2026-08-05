@@ -1,0 +1,293 @@
+import copy
+import hashlib
+import json
+import pickle
+import tempfile
+import unittest
+import os
+
+import numpy as np
+import torch
+
+from sars_adapter.contracts import (
+    load_completion_query,
+    validate_completion_query,
+)
+from sars_adapter.windowing import (
+    analyze_mask_compatibility,
+    f64_windows,
+    restore_observed_joints,
+)
+from sars_adapter.inference import (
+    build_train_prompt_provider,
+    complete_f64_with_model,
+)
+from sars_adapter.run_completion import (
+    EXTERNAL_PICKLE_PROTOCOL,
+    build_result_package,
+)
+
+
+def _hashable(value):
+    if isinstance(value, np.ndarray):
+        array = np.ascontiguousarray(value)
+        return {
+            '__ndarray__': {
+                'dtype': str(array.dtype),
+                'shape': list(array.shape),
+                'sha256': hashlib.sha256(array.tobytes(order='C')).hexdigest(),
+            }
+        }
+    if isinstance(value, dict):
+        return {key: _hashable(value[key]) for key in sorted(value)}
+    if isinstance(value, (list, tuple)):
+        return [_hashable(child) for child in value]
+    return value
+
+
+def _query():
+    package = {
+        'format': 'sars_inter_external_completion_query',
+        'version': 2,
+        'dataset_profile': 'custom',
+        'source_split': 'test',
+        'completion_scope': 'all_split',
+        'selection_manifest_hash': None,
+        'sample_order': ['sample-a'],
+        'frame_count': 64,
+        'joint_count': 17,
+        'missing_mask_semantics': 'True=missing',
+        'coordinate_contract': {
+            'skeleton': 'H36M17',
+            'axis_order': ['x_lateral', 'y_depth', 'z_height'],
+            'unit': 'dataset_normalized',
+        },
+        'temporal_metadata': {'frame_count': 64, 'fps': 30},
+        'masked_keypoint': np.zeros((1, 64, 17, 3), dtype=np.float32),
+        'missing_mask': np.zeros((1, 64, 17), dtype=bool),
+        'metadata': {},
+    }
+    encoded = json.dumps(
+        _hashable(package), sort_keys=True, separators=(',', ':')
+    ).encode('utf-8')
+    package['query_hash'] = hashlib.sha256(encoded).hexdigest()
+    return package
+
+
+def _rehash_query(package):
+    package.pop('query_hash', None)
+    encoded = json.dumps(
+        _hashable(package), sort_keys=True, separators=(',', ':')
+    ).encode('utf-8')
+    package['query_hash'] = hashlib.sha256(encoded).hexdigest()
+    return package
+
+
+class CompletionContractTest(unittest.TestCase):
+    def test_query_loader_rejects_evaluation_fields(self):
+        package = _query()
+        package['labels'] = [1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = tmpdir + '/query.pkl'
+            with open(path, 'wb') as stream:
+                pickle.dump(package, stream)
+            with self.assertRaisesRegex(ValueError, 'unsupported fields'):
+                load_completion_query(path)
+
+    def test_query_loader_rejects_nested_evaluation_fields_and_missing_keys(self):
+        package = _query()
+        package['metadata'] = {'rows': [{'clean_skeleton': 'private'}]}
+        _rehash_query(package)
+        with self.assertRaisesRegex(ValueError, 'private evaluation'):
+            validate_completion_query(package)
+
+        package = _query()
+        package.pop('temporal_metadata')
+        _rehash_query(package)
+        with self.assertRaisesRegex(ValueError, 'missing required fields'):
+            validate_completion_query(package)
+
+        package = _query()
+        package['metadata'] = {
+            'rows': np.array(
+                [(1,)], dtype=[('clean_skeleton', np.int32)]
+            )
+        }
+        _rehash_query(package)
+        with self.assertRaisesRegex(TypeError, 'JSON-like'):
+            validate_completion_query(package)
+
+    def test_query_loader_requires_float32_and_boolean_mask(self):
+        package = _query()
+        package['masked_keypoint'] = package['masked_keypoint'].astype(np.float64)
+        _rehash_query(package)
+        with self.assertRaisesRegex(ValueError, 'float32'):
+            validate_completion_query(package)
+
+        package = _query()
+        package['missing_mask'] = package['missing_mask'].astype(np.uint8)
+        _rehash_query(package)
+        with self.assertRaisesRegex(ValueError, 'dtype must be bool'):
+            validate_completion_query(package)
+
+    def test_query_loader_accepts_explicit_boolean_mask(self):
+        package = _query()
+        package['missing_mask'][0, :, 3] = True
+        package.pop('query_hash')
+        encoded = json.dumps(
+            _hashable(package), sort_keys=True, separators=(',', ':')
+        ).encode('utf-8')
+        package['query_hash'] = hashlib.sha256(encoded).hexdigest()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = tmpdir + '/query.pkl'
+            with open(path, 'wb') as stream:
+                pickle.dump(package, stream)
+            loaded = load_completion_query(path)
+        self.assertEqual(loaded['missing_mask'].dtype, np.bool_)
+        self.assertTrue(loaded['missing_mask'][0, 0, 3])
+
+
+class WindowingTest(unittest.TestCase):
+    def test_f64_uses_four_non_overlapping_f16_windows(self):
+        self.assertEqual(f64_windows(), [(0, 16), (16, 32), (32, 48), (48, 64)])
+
+    def test_mask_compatibility_marks_temporal_and_boundary_joint_ood(self):
+        mask = np.zeros((64, 17), dtype=bool)
+        mask[:, 3:9] = True
+        official = analyze_mask_compatibility(mask)
+        self.assertTrue(official['official_mc_compatible'])
+
+        mask[4:8, 3] = False
+        mask[:, 0] = True
+        ood = analyze_mask_compatibility(mask)
+        self.assertFalse(ood['official_mc_compatible'])
+        self.assertIn('time_varying_within_window', ood['reasons'])
+        self.assertIn('unsupported_boundary_joint', ood['reasons'])
+
+        mask = np.zeros((64, 17), dtype=bool)
+        mask[:, 3] = True
+        ood = analyze_mask_compatibility(mask)
+        self.assertFalse(ood['official_mc_compatible'])
+        self.assertIn('unsupported_missing_count', ood['reasons'])
+
+    def test_restore_observed_joints_is_exact(self):
+        masked = np.arange(64 * 17 * 3, dtype=np.float32).reshape(64, 17, 3)
+        missing = np.zeros((64, 17), dtype=bool)
+        missing[:, 4] = True
+        generated = np.full_like(masked, -3.0)
+        restored = restore_observed_joints(masked, generated, missing)
+        np.testing.assert_array_equal(restored[~missing], masked[~missing])
+        np.testing.assert_array_equal(restored[missing], generated[missing])
+
+
+class _FakeDynamicModel(torch.nn.Module):
+    def forward(self, prompt, query, epoch=None):
+        batch = query.shape[0]
+        prediction = torch.full(
+            (batch, 16, 17, 3), 7.0, dtype=query.dtype, device=query.device
+        )
+        return prediction, query[:, 16:]
+
+
+class InferenceAdapterTest(unittest.TestCase):
+    def test_completion_uses_explicit_mask_and_restores_observed(self):
+        masked = np.ones((1, 64, 17, 3), dtype=np.float32)
+        missing = np.zeros((1, 64, 17), dtype=bool)
+        missing[:, :, 3:9] = True
+        masked[missing] = 0.0
+        demo_input = np.full((16, 17, 3), 2.0, dtype=np.float32)
+        demo_target = np.full((16, 17, 3), 3.0, dtype=np.float32)
+
+        def prompt_provider(sample_index, window_index, window_mask):
+            return demo_input, demo_target, {
+                'source_split': 'train',
+                'identity': f'demo-{sample_index}-{window_index}',
+            }
+
+        completed, metadata = complete_f64_with_model(
+            model=_FakeDynamicModel(),
+            masked_keypoint=masked,
+            missing_mask=missing,
+            prompt_provider=prompt_provider,
+            device='cpu',
+            mask_policy='strict_official_mc',
+        )
+        np.testing.assert_array_equal(completed[~missing], masked[~missing])
+        np.testing.assert_array_equal(completed[missing], 7.0)
+        self.assertEqual(len(metadata['windows']), 4)
+        self.assertEqual(metadata['demonstration_source_splits'], ['train'])
+
+    def test_prompt_provider_uses_only_deterministic_mc_train_files(self):
+        with tempfile.TemporaryDirectory() as root:
+            train_dir = os.path.join(root, '3DPW_MC', 'train')
+            os.makedirs(train_dir)
+            for index in range(2):
+                payload = {
+                    'data_input': np.full(
+                        (16, 18, 3), float(index + 1), dtype=np.float32
+                    ),
+                    'data_label': np.full(
+                        (16, 18, 3), float(index + 2), dtype=np.float32
+                    ),
+                }
+                with open(os.path.join(train_dir, '{}.pkl'.format(index)), 'wb') as stream:
+                    pickle.dump(payload, stream)
+            provider = build_train_prompt_provider(
+                data_root=root,
+                source_config=os.path.join(
+                    os.path.dirname(os.path.dirname(__file__)),
+                    'configs',
+                    'default.yaml',
+                ),
+                seed=42,
+            )
+            first = provider(0, 0, np.zeros((16, 17), dtype=bool))
+            second = provider(0, 0, np.zeros((16, 17), dtype=bool))
+
+        np.testing.assert_array_equal(first[0], second[0])
+        self.assertEqual(first[2]['source_split'], 'train')
+        self.assertEqual(first[2]['identity'], second[2]['identity'])
+        self.assertEqual(first[0].shape, (16, 17, 3))
+
+    def test_result_package_binds_query_and_records_runtime_policy(self):
+        query = _query()
+        completed = np.ones((1, 64, 17, 3), dtype=np.float32)
+        package = build_result_package(
+            query=query,
+            completed_keypoint=completed,
+            repository_commit='361e1c0b9552baa8510e00dbb33629debfd66873',
+            checkpoint_identity='a' * 64,
+            runtime_metadata={'total_seconds': 1.0, 'device': 'cpu'},
+            method_metadata={
+                'inference_task': 'joint_completion',
+                'demonstration_source_splits': ['train'],
+                'window_policy': 'non_overlapping_f16',
+            },
+        )
+        self.assertEqual(package['query_hash'], query['query_hash'])
+
+    def test_external_result_uses_pickle_protocol_four(self):
+        query = _query()
+        package = build_result_package(
+            query=query,
+            completed_keypoint=query['masked_keypoint'],
+            repository_commit='commit',
+            checkpoint_identity='checkpoint',
+            runtime_metadata={'total_seconds': 1.0, 'device': 'cpu'},
+            method_metadata={
+                'inference_task': 'joint_completion',
+                'demonstration_source_splits': ['train'],
+            },
+        )
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, 'result.pkl')
+            with open(path, 'wb') as stream:
+                pickle.dump(package, stream, protocol=EXTERNAL_PICKLE_PROTOCOL)
+            with open(path, 'rb') as stream:
+                self.assertEqual(stream.read(2), b'\x80\x04')
+        self.assertEqual(package['sample_order'], ['sample-a'])
+        self.assertEqual(len(package['result_hash']), 64)
+
+
+if __name__ == '__main__':
+    unittest.main()
