@@ -1,6 +1,7 @@
 import os
 import shutil
 import numpy as np
+import json
 import argparse
 import errno
 import tensorboardX
@@ -358,25 +359,44 @@ def train_with_config(args, opts):
     train_writer = tensorboardX.SummaryWriter(os.path.join(opts.checkpoint, "logs"))
 
     print('\nLoading dataset...')
+    num_workers = int(args.get('num_workers', 12))
+    pin_memory = bool(args.get('pin_memory', True))
     trainloader_params = {
           'batch_size': args.batch_size,
           'shuffle': True,
-          'num_workers': 12,
-          'pin_memory': True,
-          'prefetch_factor': 4,
-          'persistent_workers': True
+          'num_workers': num_workers,
+          'pin_memory': pin_memory,
     }
     testloader_params = {
           'batch_size': args.test_batch_size,
           'shuffle': False,
-          'num_workers': 12,
-          'pin_memory': True,
-          'prefetch_factor': 4,
-          'persistent_workers': True
+          'num_workers': num_workers,
+          'pin_memory': pin_memory,
     }
+    if num_workers > 0:
+        prefetch_factor = int(args.get('prefetch_factor', 4))
+        persistent_workers = bool(args.get('persistent_workers', True))
+        trainloader_params.update(
+            prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers,
+        )
+        testloader_params.update(
+            prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers,
+        )
 
 
     train_dataset = MotionDataset3D(args, data_split='train')        
+    subset_manifest = {
+        'format': 'skeleton_in_context_training_subset',
+        'version': 1,
+        'subset_seed': int(args.get('subset_seed', 0)),
+        'data_root': os.path.abspath(args.data.root_path),
+        'tasks': list(args.tasks),
+        'selected_train_files': train_dataset.selection_manifest,
+    }
+    with open(os.path.join(opts.checkpoint, 'training_subset_manifest.json'), 'w') as stream:
+        json.dump(subset_manifest, stream, indent=2, sort_keys=True)
     train_loader_3d = DataLoader(train_dataset, **trainloader_params)
 
     test_dataset = MotionDataset3D(args, data_split='test', prompt_list=train_dataset.prompt_list)

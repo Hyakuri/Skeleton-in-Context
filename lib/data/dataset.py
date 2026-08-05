@@ -2,8 +2,33 @@ import torch
 import numpy as np
 import os
 import random
+import hashlib
 from torch.utils.data import Dataset
 from lib.utils.tools import read_pkl
+
+
+def select_deterministic_task_subset(file_list, limit, seed, task, data_split):
+    """按任务和 split 稳定选择训练子集，测试集默认不裁剪。"""
+    ordered = sorted(file_list)
+    if data_split != 'train' or limit is None:
+        return ordered
+    limit = int(limit)
+    if limit <= 0:
+        raise ValueError(f'train sample limit for {task} must be positive')
+    if limit >= len(ordered):
+        return ordered
+    token = f'{int(seed)}:{task}:{data_split}'.encode('utf-8')
+    stable_seed = int.from_bytes(hashlib.sha256(token).digest()[:8], 'big')
+    rng = random.Random(stable_seed)
+    return sorted(rng.sample(ordered, limit))
+
+
+def _task_train_limit(args, task):
+    limits = args.get('train_sample_limits', None)
+    if not limits:
+        return None
+    return limits.get(task)
+
 
 class MotionDataset(Dataset):
     def __init__(self, args, data_split, prompt_list=None):   # data_split: 'train' or 'test'
@@ -17,6 +42,7 @@ class MotionDataset(Dataset):
         self.is_train_dataset = (True if data_split == 'train' else False)
         query_list = []
         sample_count = {}
+        selection_manifest = {}
         global_idx_list = {task: [] for task in args.data.datasets if task in args.tasks}
         if self.is_train_dataset:
             prompt_list = {task: [] for task in args.data.datasets if task in args.tasks}
@@ -26,7 +52,15 @@ class MotionDataset(Dataset):
                 continue
             data_path = os.path.join(args.data.root_path, dataset_folder, data_split)
             file_list = sorted(os.listdir(data_path))
+            file_list = select_deterministic_task_subset(
+                file_list,
+                _task_train_limit(args, task),
+                args.get('subset_seed', 0),
+                task,
+                data_split,
+            )
             sample_count[task] = len(file_list)
+            selection_manifest[task] = list(file_list)
             for data_file in file_list:
                 file_path = os.path.join(data_path, data_file)
                 query_list.append({"task": task, "file_path": file_path})
@@ -39,6 +73,7 @@ class MotionDataset(Dataset):
         self.query_list = query_list
         self.global_idx_list = global_idx_list
         self.prompt_list = prompt_list
+        self.selection_manifest = selection_manifest
         self.task_to_flag = args.task_to_flag
 
     def __len__(self):
