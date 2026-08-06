@@ -19,6 +19,7 @@ from lib.utils.tools import get_config
 from sars_adapter.contracts import load_completion_query
 from sars_adapter.coordinate_adapter import TRANSFORM_MODE
 from sars_adapter.inference import (
+    build_train_prompt_pool,
     build_train_prompt_provider,
     complete_f64_with_model,
 )
@@ -26,12 +27,18 @@ from sars_adapter.inference import (
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXTERNAL_PICKLE_PROTOCOL = 4
+OFFICIAL_UPSTREAM_REPOSITORY_URL = (
+    'https://github.com/fanglaosi/Skeleton-in-Context'
+)
+OFFICIAL_UPSTREAM_COMMIT = '361e1c0b9552baa8510e00dbb33629debfd66873'
+ADAPTER_FORK_REPOSITORY_URL = 'https://github.com/Hyakuri/Skeleton-in-Context'
 
 
 def build_direct_run_config():
     """集中放置外部补全推理需要手动调整的参数。"""
     return {
         'dry_run': True,  # True=仅检查输入；False=执行真实 GPU 推理。
+        'require_clean_repository': True,  # True=正式补值只允许无未提交改动的仓库。
         'query_path': '<COMPLETION_QUERY_PATH>',  # SARS-Inter V2 query，不得传评价 sidecar。
         'checkpoint_path': '<SIC_CHECKPOINT_PATH>',  # SiC latest/best checkpoint。
         'source_config': os.path.join(PROJECT_ROOT, 'configs', 'default.yaml'),  # 训练使用的官方基础配置。
@@ -151,6 +158,7 @@ def build_result_package(
     checkpoint_identity,
     runtime_metadata,
     method_metadata,
+    provenance=None,
 ):
     completed = np.asarray(completed_keypoint, dtype=np.float32)
     if completed.shape != (len(query['sample_order']), 64, 17, 3):
@@ -173,6 +181,7 @@ def build_result_package(
         'checkpoint_identity': str(checkpoint_identity),
         'runtime_metadata': copy.deepcopy(runtime_metadata),
         'method_metadata': copy.deepcopy(method_metadata),
+        'provenance': copy.deepcopy(dict(provenance or {})),
     }
     package['result_hash'] = _package_hash(package, 'result_hash')
     return package
@@ -242,7 +251,160 @@ def _load_model(source_config, data_root, checkpoint_path, device):
     return model.to(torch.device(device))
 
 
-def run_completion(config):
+def _resolve_runtime_paths(config):
+    resolved = copy.deepcopy(dict(config))
+    for name in ('checkpoint_path', 'source_config', 'data_root'):
+        value = os.path.abspath(os.path.expanduser(str(resolved.get(name) or '')))
+        if not value or '<' in value or '>' in value:
+            raise ValueError('{} still contains a placeholder'.format(name))
+        resolved[name] = value
+    for name in ('checkpoint_path', 'source_config'):
+        if not os.path.isfile(resolved[name]):
+            raise FileNotFoundError(resolved[name])
+    if not os.path.isdir(resolved['data_root']):
+        raise FileNotFoundError(resolved['data_root'])
+    resolved['device'] = str(resolved.get('device') or 'cuda:0')
+    resolved['require_clean_repository'] = bool(
+        resolved.get('require_clean_repository', True)
+    )
+    transform_mode = resolved.get('coordinate_transform_mode')
+    if transform_mode not in {'identity_h36m17', TRANSFORM_MODE}:
+        raise ValueError('unsupported coordinate_transform_mode')
+    resolved['demonstration_selection_policy'] = (
+        _resolve_demonstration_selection_policy(
+            transform_mode, resolved.get('demonstration_selection_policy')
+        )
+    )
+    return resolved
+
+
+def _completion_policy(resolved):
+    return {
+        'inference_task': 'joint_completion',
+        'window_policy': 'non_overlapping_f16',
+        'mask_policy': str(
+            resolved.get('mask_policy', 'allow_ood_explicit')
+        ),
+        'coordinate_transform_mode': str(
+            resolved['coordinate_transform_mode']
+        ),
+        'demonstration_source_split': 'train',
+        'demonstration_seed': int(resolved.get('demonstration_seed', 42)),
+        'demonstration_selection_policy': str(
+            resolved['demonstration_selection_policy']
+        ),
+        'observed_joint_policy': 'exact_restore',
+    }
+
+
+def prepare_completion_runtime(config, runtime=None, load_model=True):
+    """准备可跨 query 复用、但不保存 query 私有状态的运行时。"""
+    resolved = _resolve_runtime_paths(config)
+    shared = runtime if runtime is not None else {}
+    signature = (
+        resolved['source_config'], resolved['data_root'],
+        resolved['checkpoint_path'], resolved['device'],
+        resolved['coordinate_transform_mode'],
+        resolved['demonstration_selection_policy'],
+        int(resolved.get('demonstration_seed', 42)),
+        str(resolved.get('mask_policy', 'allow_ood_explicit')),
+        bool(resolved['require_clean_repository']),
+    )
+    previous = shared.get('runtime_signature')
+    if previous is not None and tuple(previous) != signature:
+        raise ValueError('shared completion runtime configuration mismatch')
+    shared['runtime_signature'] = signature
+    if 'prompt_pool' not in shared:
+        shared['prompt_pool'] = build_train_prompt_pool(
+            resolved['data_root'], resolved['source_config']
+        )
+    if 'repository_identity' not in shared:
+        shared['repository_identity'] = _repository_identity()
+    if (
+        resolved['require_clean_repository']
+        and bool(shared['repository_identity'][1])
+    ):
+        raise ValueError(
+            'formal SiC completion requires a clean repository worktree'
+        )
+    if 'checkpoint_sha256' not in shared:
+        shared['checkpoint_sha256'] = _sha256_file(
+            resolved['checkpoint_path']
+        )
+    if 'provenance' not in shared:
+        commit, dirty, worktree_hash = shared['repository_identity']
+        prompt_pool = shared['prompt_pool']
+        shared['provenance'] = {
+            'official_upstream': {
+                'repository_url': OFFICIAL_UPSTREAM_REPOSITORY_URL,
+                'commit': OFFICIAL_UPSTREAM_COMMIT,
+            },
+            'adapter_fork': {
+                'repository_url': ADAPTER_FORK_REPOSITORY_URL,
+                'commit': commit,
+                'repository_dirty': bool(dirty),
+                'repository_worktree_sha256': worktree_hash,
+            },
+            'checkpoint': {
+                'sha256': shared['checkpoint_sha256'],
+            },
+            'prompt_pool': {
+                'manifest_sha256': prompt_pool[
+                    'prompt_pool_manifest_sha256'
+                ],
+                'file_count': int(prompt_pool['prompt_pool_file_count']),
+                'source_config_sha256': prompt_pool[
+                    'source_config_sha256'
+                ],
+            },
+            'completion_policy': _completion_policy(resolved),
+        }
+    if load_model and 'model' not in shared:
+        shared['model'] = _load_model(
+            resolved['source_config'], resolved['data_root'],
+            resolved['checkpoint_path'], resolved['device']
+        )
+        if _sha256_file(resolved['checkpoint_path']) != shared['checkpoint_sha256']:
+            raise RuntimeError('SiC checkpoint changed while loading the model')
+        if (
+            _sha256_file(resolved['source_config'])
+            != shared['prompt_pool']['source_config_sha256']
+        ):
+            raise RuntimeError('SiC source config changed while loading the model')
+        if _repository_identity() != shared['repository_identity']:
+            raise RuntimeError('SiC repository changed while loading the model')
+    return shared
+
+
+def verify_completion_runtime_assets(config, runtime):
+    """在 series 结束前复核冻结资产，防止长任务期间身份漂移。"""
+    resolved = _resolve_runtime_paths(config)
+    shared = dict(runtime or {})
+    if _sha256_file(resolved['checkpoint_path']) != shared.get(
+        'checkpoint_sha256'
+    ):
+        raise RuntimeError('SiC checkpoint changed during completion series')
+    current_pool = build_train_prompt_pool(
+        resolved['data_root'], resolved['source_config']
+    )
+    frozen_pool = shared.get('prompt_pool') or {}
+    for field in (
+        'prompt_pool_manifest_sha256',
+        'prompt_pool_file_count',
+        'source_config_sha256',
+    ):
+        if current_pool.get(field) != frozen_pool.get(field):
+            raise RuntimeError(
+                'SiC prompt pool changed during completion series: {}'.format(
+                    field
+                )
+            )
+    if _repository_identity() != tuple(shared.get('repository_identity') or ()):
+        raise RuntimeError('SiC repository changed during completion series')
+    return True
+
+
+def run_completion(config, runtime=None):
     resolved = copy.deepcopy(dict(config))
     for name in ('query_path', 'checkpoint_path', 'source_config', 'data_root', 'output_path'):
         value = os.path.abspath(os.path.expanduser(str(resolved.get(name) or '')))
@@ -271,16 +433,16 @@ def run_completion(config):
     }
     if resolved.get('dry_run', True):
         return preview
-    commit, dirty, worktree_hash = _repository_identity()
-    model = _load_model(
-        resolved['source_config'], resolved['data_root'],
-        resolved['checkpoint_path'], resolved['device']
-    )
+    resolved['demonstration_selection_policy'] = selection_policy
+    shared = prepare_completion_runtime(resolved, runtime=runtime, load_model=True)
+    commit, dirty, worktree_hash = shared['repository_identity']
+    model = shared['model']
     prompt_provider = build_train_prompt_provider(
         resolved['data_root'], resolved['source_config'],
         seed=int(resolved.get('demonstration_seed', 42)),
         selection_policy=selection_policy,
         selection_keys=_sample_input_selection_keys(query),
+        prompt_pool=shared['prompt_pool'],
     )
     started = time.perf_counter()
     completed, inference_metadata = complete_f64_with_model(
@@ -298,7 +460,7 @@ def run_completion(config):
         raise RuntimeError(
             'repository worktree changed during SiC inference; result was not saved'
         )
-    checkpoint_hash = _sha256_file(resolved['checkpoint_path'])
+    checkpoint_hash = shared['checkpoint_sha256']
     runtime = {
         'total_seconds': float(elapsed),
         'device': resolved['device'],
@@ -329,6 +491,7 @@ def run_completion(config):
         checkpoint_identity=checkpoint_hash,
         runtime_metadata=runtime,
         method_metadata=method_metadata,
+        provenance=shared['provenance'],
     )
     output_dir = os.path.dirname(resolved['output_path'])
     if output_dir:

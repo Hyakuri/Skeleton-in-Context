@@ -30,11 +30,8 @@ def _sha256_file(path):
     return digest.hexdigest()
 
 
-def build_train_prompt_provider(
-    data_root, source_config, seed=42, selection_policy='per_window',
-    selection_keys=None,
-):
-    """从官方 3DPW_MC/train 稳定选择 demonstration。"""
+def build_train_prompt_pool(data_root, source_config):
+    """冻结 3DPW_MC/train prompt pool 的内容身份与关节映射。"""
     train_dir = os.path.join(os.path.abspath(data_root), '3DPW_MC', 'train')
     if not os.path.isdir(train_dir):
         raise FileNotFoundError(train_dir)
@@ -46,20 +43,41 @@ def build_train_prompt_provider(
     if not files:
         raise ValueError('3DPW_MC/train contains no demonstration files')
     args = get_config(source_config)
-    joint_map = args.amass_to_h36m
+    pool_digest = hashlib.sha256()
+    file_hashes = {}
+    for path in files:
+        file_hash = _sha256_file(path)
+        file_hashes[path] = file_hash
+        record = '{}\0{}\0{}'.format(
+            os.path.basename(path), os.path.getsize(path), file_hash
+        ).encode('utf-8')
+        pool_digest.update(len(record).to_bytes(8, 'big'))
+        pool_digest.update(record)
+    return {
+        'files': files,
+        'file_sha256_by_path': file_hashes,
+        'joint_map': args.amass_to_h36m,
+        'prompt_pool_file_count': int(len(files)),
+        'prompt_pool_manifest_sha256': pool_digest.hexdigest(),
+        'source_config_sha256': _sha256_file(source_config),
+    }
+
+
+def build_train_prompt_provider(
+    data_root, source_config, seed=42, selection_policy='per_window',
+    selection_keys=None, prompt_pool=None,
+):
+    """从官方 3DPW_MC/train 稳定选择 demonstration。"""
+    pool = dict(prompt_pool or build_train_prompt_pool(data_root, source_config))
+    files = list(pool['files'])
+    joint_map = pool['joint_map']
     if selection_policy not in {'per_window', 'per_sample_fixed'}:
         raise ValueError('unsupported demonstration selection_policy')
     if selection_keys is not None:
         selection_keys = [str(value) for value in selection_keys]
-    pool_digest = hashlib.sha256()
-    for path in files:
-        record = '{}\0{}'.format(
-            os.path.basename(path), os.path.getsize(path)
-        ).encode('utf-8')
-        pool_digest.update(len(record).to_bytes(8, 'big'))
-        pool_digest.update(record)
-    pool_hash = pool_digest.hexdigest()
-    source_config_hash = _sha256_file(source_config)
+    pool_hash = str(pool['prompt_pool_manifest_sha256'])
+    source_config_hash = str(pool['source_config_sha256'])
+    file_hashes = dict(pool.get('file_sha256_by_path') or {})
 
     def provider(sample_index, window_index, window_mask):
         if selection_policy == 'per_sample_fixed':
@@ -76,6 +94,12 @@ def build_train_prompt_provider(
             hashlib.sha256(token.encode('utf-8')).digest()[:8], 'big'
         ) % len(files)
         path = files[index]
+        expected_file_hash = file_hashes.get(path)
+        actual_file_hash = _sha256_file(path)
+        if not expected_file_hash or actual_file_hash != expected_file_hash:
+            raise RuntimeError(
+                'prompt demonstration changed after pool freeze: {}'.format(path)
+            )
         payload = read_pkl(path)
         prompt_input = skel_to_h36m(
             np.asarray(payload['data_input']), joint_map
@@ -90,7 +114,7 @@ def build_train_prompt_provider(
         metadata = {
             'source_split': 'train',
             'identity': os.path.basename(path),
-            'sha256': _sha256_file(path),
+            'sha256': actual_file_hash,
             'selection_seed': int(seed),
             'selection_policy': selection_policy,
             'selection_key_sha256': hashlib.sha256(
@@ -106,6 +130,9 @@ def build_train_prompt_provider(
             metadata,
         )
 
+    provider.prompt_pool_file_count = int(len(files))
+    provider.prompt_pool_manifest_sha256 = pool_hash
+    provider.source_config_sha256 = source_config_hash
     return provider
 
 
@@ -309,4 +336,7 @@ def complete_f64_with_model(
     return completed, metadata
 
 
-__all__ = ['build_train_prompt_provider', 'complete_f64_with_model']
+__all__ = [
+    'build_train_prompt_pool', 'build_train_prompt_provider',
+    'complete_f64_with_model',
+]

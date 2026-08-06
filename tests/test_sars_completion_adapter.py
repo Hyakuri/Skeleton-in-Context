@@ -19,6 +19,7 @@ from sars_adapter.windowing import (
     restore_observed_joints,
 )
 from sars_adapter.inference import (
+    build_train_prompt_pool,
     build_train_prompt_provider,
     complete_f64_with_model,
 )
@@ -317,6 +318,54 @@ class InferenceAdapterTest(unittest.TestCase):
         )
         self.assertEqual(len(first[2]['source_config_sha256']), 64)
         self.assertEqual(len(first[2]['selection_key_sha256']), 64)
+
+    def test_prompt_pool_manifest_changes_when_file_content_changes(self):
+        with tempfile.TemporaryDirectory() as root:
+            train_dir = os.path.join(root, '3DPW_MC', 'train')
+            os.makedirs(train_dir)
+            path = os.path.join(train_dir, 'same-size.pkl')
+            with open(path, 'wb') as stream:
+                stream.write(b'content-a')
+            common = {
+                'data_root': root,
+                'source_config': os.path.join(
+                    os.path.dirname(os.path.dirname(__file__)),
+                    'configs', 'default.yaml',
+                ),
+            }
+            first = build_train_prompt_provider(**common)
+            with open(path, 'wb') as stream:
+                stream.write(b'content-b')
+            second = build_train_prompt_provider(**common)
+
+        self.assertNotEqual(
+            first.prompt_pool_manifest_sha256,
+            second.prompt_pool_manifest_sha256,
+        )
+
+    def test_prompt_provider_rejects_selected_demo_content_drift(self):
+        with tempfile.TemporaryDirectory() as root:
+            train_dir = os.path.join(root, '3DPW_MC', 'train')
+            os.makedirs(train_dir)
+            path = os.path.join(train_dir, 'demo.pkl')
+            with open(path, 'wb') as stream:
+                pickle.dump(np.zeros((16, 17, 3), dtype=np.float32), stream)
+            source_config = os.path.join(
+                os.path.dirname(os.path.dirname(__file__)),
+                'configs', 'default.yaml',
+            )
+            pool = build_train_prompt_pool(root, source_config)
+            provider = build_train_prompt_provider(
+                root,
+                source_config,
+                prompt_pool=pool,
+                selection_keys=['sample-key'],
+            )
+            with open(path, 'wb') as stream:
+                pickle.dump(np.ones((16, 17, 3), dtype=np.float32), stream)
+
+            with self.assertRaisesRegex(RuntimeError, 'prompt.*changed'):
+                provider(0, 0, np.zeros((16, 17), dtype=bool))
 
     def test_prompt_provider_can_reuse_one_train_demo_for_all_windows(self):
         with tempfile.TemporaryDirectory() as root:
