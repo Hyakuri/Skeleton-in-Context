@@ -17,6 +17,7 @@ import torch
 from lib.utils.learning import load_backbone
 from lib.utils.tools import get_config
 from sars_adapter.contracts import load_completion_query
+from sars_adapter.coordinate_adapter import TRANSFORM_MODE
 from sars_adapter.inference import (
     build_train_prompt_provider,
     complete_f64_with_model,
@@ -39,7 +40,8 @@ def build_direct_run_config():
         'device': 'cuda:0',  # 可选 cuda:0 或 cpu。
         'mask_policy': 'allow_ood_explicit',  # strict_official_mc 或 allow_ood_explicit。
         'demonstration_seed': 42,  # 只从 3DPW_MC/train 稳定选择 demonstration。
-        'coordinate_transform_mode': 'identity_h36m17',  # 当前保持 query 的 H36M17 坐标值。
+        'demonstration_selection_policy': 'per_sample_fixed',  # 四个 F16 窗口共用同一 train demonstration。
+        'coordinate_transform_mode': TRANSFORM_MODE,  # 正式比较使用项目 H36M17 到 SiC 的可逆坐标适配。
     }
 
 
@@ -93,6 +95,12 @@ def _update_length_prefixed(digest, value):
     digest.update(payload)
 
 
+def _git_command(*arguments):
+    """只为当前仓库进程声明 safe.directory，不修改全局 Git 配置。"""
+    safe_root = PROJECT_ROOT.replace('\\', '/')
+    return ['git', '-c', 'safe.directory={}'.format(safe_root)] + list(arguments)
+
+
 def build_result_package(
     query,
     completed_keypoint,
@@ -129,13 +137,13 @@ def build_result_package(
 
 def _repository_identity():
     commit = subprocess.check_output(
-        ['git', 'rev-parse', 'HEAD'], cwd=PROJECT_ROOT
+        _git_command('rev-parse', 'HEAD'), cwd=PROJECT_ROOT
     ).decode('ascii').strip()
     tracked_diff = subprocess.check_output(
-        ['git', 'diff', '--binary', 'HEAD', '--'], cwd=PROJECT_ROOT
+        _git_command('diff', '--binary', 'HEAD', '--'), cwd=PROJECT_ROOT
     )
     untracked_output = subprocess.check_output(
-        ['git', 'ls-files', '--others', '--exclude-standard', '-z'],
+        _git_command('ls-files', '--others', '--exclude-standard', '-z'),
         cwd=PROJECT_ROOT,
     )
     untracked_paths = [
@@ -204,8 +212,19 @@ def run_completion(config):
     if not os.path.isdir(resolved['data_root']):
         raise FileNotFoundError(resolved['data_root'])
     query = load_completion_query(resolved['query_path'])
-    if resolved.get('coordinate_transform_mode') != 'identity_h36m17':
+    transform_mode = resolved.get('coordinate_transform_mode')
+    if transform_mode not in {'identity_h36m17', TRANSFORM_MODE}:
         raise ValueError('unsupported coordinate_transform_mode')
+    if transform_mode == TRANSFORM_MODE:
+        contract = query.get('coordinate_contract') or {}
+        if contract.get('skeleton') != 'H36M17':
+            raise ValueError('formal coordinate adapter requires H36M17 query')
+        if contract.get('axis_order') != [
+            'x_lateral', 'y_depth', 'z_height'
+        ]:
+            raise ValueError(
+                'formal coordinate adapter requires project Z-up axis_order'
+            )
     preview = {
         'status': 'planned' if resolved.get('dry_run', True) else 'running',
         'query_hash': query['query_hash'],
@@ -222,6 +241,9 @@ def run_completion(config):
     prompt_provider = build_train_prompt_provider(
         resolved['data_root'], resolved['source_config'],
         seed=int(resolved.get('demonstration_seed', 42)),
+        selection_policy=resolved.get(
+            'demonstration_selection_policy', 'per_sample_fixed'
+        ),
     )
     started = time.perf_counter()
     completed, inference_metadata = complete_f64_with_model(
@@ -231,6 +253,7 @@ def run_completion(config):
         prompt_provider=prompt_provider,
         device=resolved['device'],
         mask_policy=resolved.get('mask_policy', 'allow_ood_explicit'),
+        coordinate_transform_mode=transform_mode,
     )
     elapsed = time.perf_counter() - started
     final_identity = _repository_identity()
@@ -249,10 +272,15 @@ def run_completion(config):
         'inference_task': 'joint_completion',
         'demonstration_source_splits': ['train'],
         'demonstration_seed': int(resolved.get('demonstration_seed', 42)),
+        'demonstration_selection_policy': resolved.get(
+            'demonstration_selection_policy', 'per_sample_fixed'
+        ),
         'window_policy': inference_metadata['window_policy'],
         'window_records': inference_metadata['windows'],
         'mask_policy': inference_metadata['mask_policy'],
         'coordinate_transform_mode': resolved['coordinate_transform_mode'],
+        'sample_transforms': inference_metadata['sample_transforms'],
+        'boundary_diagnostics': inference_metadata['boundary_diagnostics'],
         'observed_restoration_max_abs_error': inference_metadata[
             'observed_restoration_max_abs_error'
         ],

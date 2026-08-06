@@ -14,7 +14,9 @@
 [0:16], [16:32], [32:48], [48:64]
 ```
 
-每个窗口从官方 `3DPW_MC/train` 中确定性选择 demonstration，并把 query 的显式窗口 mask 同步应用到 demonstration input。模型预测只替换 `missing_mask=True` 的坐标，全部可见坐标都会被精确恢复。
+正式比较模式为每个 F64 sample 从官方 `3DPW_MC/train` 中确定性选择一个 demonstration，四个窗口重复使用同一个 demonstration。Query 的显式窗口 mask 会同步应用到 demonstration input。模型预测只替换 `missing_mask=True` 的坐标，全部可见坐标都会被精确恢复。
+
+适配器会报告第 16、32、48 帧边界的位置和速度不连续度，但不会对生成关节做平滑或插值，避免给 SiC 增加其他补值方法没有使用的额外后处理。
 
 ## Mask 模式
 
@@ -36,7 +38,8 @@
 - `device`：`cuda:0` 或 `cpu`。
 - `mask_policy`：官方 MC 严格支持或显式 OOD 研究模式。
 - `demonstration_seed`：train-only demonstration 的确定性选择 seed。
-- `coordinate_transform_mode`：当前只支持 `identity_h36m17`。
+- `demonstration_selection_policy`：正式比较使用 `per_sample_fixed`，四个窗口共享一个 train demonstration。
+- `coordinate_transform_mode`：正式 SARS-Inter 比较使用 `project_h36m17_prompt_aligned_v1`；`identity_h36m17` 只用于复现历史结果。
 
 在 SiC 仓库根目录执行：
 
@@ -44,6 +47,20 @@
 <SIC_PYTHON> sars_adapter/run_completion.py
 ```
 
-## 当前坐标限制
+## 正式坐标适配
 
-适配器已经显式记录坐标转换模式，但当前只实现 identity H36M17 传递。正式报告跨数据集结果前，必须核对各 SARS-Inter 数据集与官方 3DPW-MC 的轴方向、root 约定和尺度。新增 normalization 必须可逆，并完整写入结果 metadata。
+`project_h36m17_prompt_aligned_v1` 对自获数据和 NW-UCLA 使用完全相同的确定性策略：
+
+1. 把项目的左腿/右腿和右臂/左臂分组置换到 SiC/MotionBERT H36M17 顺序。
+2. 使用 `(x, y_depth, z_height) -> (x, z_height, -y_depth)` 把项目 Z-up 坐标旋转到 SiC Y-up 空间。
+3. 只根据 query 可见坐标估计一条 F64 root 轨迹和一个可见骨段尺度。
+4. 将 query 对齐到选定的 train demonstration，运行四个 F16 窗口，再对输出执行逆变换。
+5. 精确恢复项目空间中的全部可见坐标。
+
+结果会记录关节置换、轴矩阵、root hash、sample/reference scale、prompt identity/hash、窗口边界诊断、仓库身份和 checkpoint SHA256。
+
+## 自获数据与 NW-UCLA 运行方式
+
+每个 query 分别运行一次 `sars_adapter/run_completion.py`。两个数据集必须使用相同的冻结 checkpoint、`source_config`、`data_root`、`demonstration_seed`、`mask_policy`、demonstration selection policy 和 coordinate mode；只修改 `query_path` 与 `output_path`。
+
+每份结果保存到新的方法专用 run 目录。SiC 只能接收 query 文件路径，不得让它访问包含 `completion_evaluation_sidecar.pkl` 的父目录。结果返回 SARS-Inter 后，分别使用两个数据集各自冻结的识别 checkpoint 导入和评价；两个数据集的结果分开报告，不合并准确率。

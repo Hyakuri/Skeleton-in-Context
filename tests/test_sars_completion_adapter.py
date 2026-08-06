@@ -24,6 +24,8 @@ from sars_adapter.inference import (
 )
 from sars_adapter.run_completion import (
     EXTERNAL_PICKLE_PROTOCOL,
+    _repository_identity,
+    build_direct_run_config,
     build_result_package,
 )
 
@@ -189,7 +191,33 @@ class _FakeDynamicModel(torch.nn.Module):
         return prediction, query[:, 16:]
 
 
+class _PromptTargetModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.queries = []
+
+    def forward(self, prompt, query, epoch=None):
+        self.queries.append(query.detach().cpu().numpy())
+        return prompt[:, 16:], query[:, 16:]
+
+
 class InferenceAdapterTest(unittest.TestCase):
+    def test_repository_identity_supports_isolated_worktree(self):
+        commit, dirty, worktree_hash = _repository_identity()
+        self.assertEqual(len(commit), 40)
+        self.assertIsInstance(dirty, bool)
+        self.assertEqual(len(worktree_hash), 64)
+
+    def test_direct_config_defaults_to_formal_coordinate_adapter(self):
+        config = build_direct_run_config()
+        self.assertEqual(
+            config['coordinate_transform_mode'],
+            'project_h36m17_prompt_aligned_v1',
+        )
+        self.assertEqual(
+            config['demonstration_selection_policy'], 'per_sample_fixed'
+        )
+
     def test_completion_uses_explicit_mask_and_restores_observed(self):
         masked = np.ones((1, 64, 17, 3), dtype=np.float32)
         missing = np.zeros((1, 64, 17), dtype=bool)
@@ -248,6 +276,91 @@ class InferenceAdapterTest(unittest.TestCase):
         self.assertEqual(first[2]['source_split'], 'train')
         self.assertEqual(first[2]['identity'], second[2]['identity'])
         self.assertEqual(first[0].shape, (16, 17, 3))
+
+    def test_prompt_provider_can_reuse_one_train_demo_for_all_windows(self):
+        with tempfile.TemporaryDirectory() as root:
+            train_dir = os.path.join(root, '3DPW_MC', 'train')
+            os.makedirs(train_dir)
+            for index in range(3):
+                payload = {
+                    'data_input': np.full(
+                        (16, 18, 3), float(index + 1), dtype=np.float32
+                    ),
+                    'data_label': np.full(
+                        (16, 18, 3), float(index + 2), dtype=np.float32
+                    ),
+                }
+                with open(os.path.join(train_dir, '{}.pkl'.format(index)), 'wb') as stream:
+                    pickle.dump(payload, stream)
+            provider = build_train_prompt_provider(
+                data_root=root,
+                source_config=os.path.join(
+                    os.path.dirname(os.path.dirname(__file__)),
+                    'configs',
+                    'default.yaml',
+                ),
+                seed=42,
+                selection_policy='per_sample_fixed',
+            )
+            identities = [
+                provider(0, window_index, np.zeros((16, 17), dtype=bool))[2][
+                    'identity'
+                ]
+                for window_index in range(4)
+            ]
+
+        self.assertEqual(len(set(identities)), 1)
+
+    def test_formal_coordinate_mode_uses_one_prompt_and_shared_transform(self):
+        masked = np.zeros((1, 64, 17, 3), dtype=np.float32)
+        for joint in range(17):
+            masked[0, :, joint] = [joint * 0.1, joint * 0.03, joint * 0.07]
+        missing = np.zeros((1, 64, 17), dtype=bool)
+        missing[:, :, 7:] = True
+        masked[missing] = 0.0
+
+        demo_input = np.zeros((16, 17, 3), dtype=np.float32)
+        demo_target = np.zeros((16, 17, 3), dtype=np.float32)
+        for joint in range(17):
+            demo_input[:, joint] = [joint * 0.05, joint * 0.04, joint * 0.02]
+            demo_target[:, joint] = [joint * 0.06, joint * 0.05, joint * 0.03]
+        calls = []
+
+        def prompt_provider(sample_index, window_index, window_mask):
+            calls.append((sample_index, window_index))
+            return demo_input, demo_target, {
+                'source_split': 'train',
+                'identity': 'fixed-demo',
+                'sha256': 'a' * 64,
+                'selection_policy': 'per_sample_fixed',
+            }
+
+        model = _PromptTargetModel()
+        completed, metadata = complete_f64_with_model(
+            model=model,
+            masked_keypoint=masked,
+            missing_mask=missing,
+            prompt_provider=prompt_provider,
+            device='cpu',
+            mask_policy='allow_ood_explicit',
+            coordinate_transform_mode='project_h36m17_prompt_aligned_v1',
+        )
+
+        self.assertEqual(calls, [(0, 0)])
+        self.assertEqual(len(model.queries), 4)
+        self.assertTrue(np.isfinite(completed).all())
+        np.testing.assert_array_equal(completed[~missing], masked[~missing])
+        transform = metadata['sample_transforms'][0]
+        self.assertEqual(
+            transform['transform_mode'],
+            'project_h36m17_prompt_aligned_v1',
+        )
+        self.assertTrue(transform['missing_reset_to_zero'])
+        self.assertEqual(
+            {row['demonstration']['identity'] for row in metadata['windows']},
+            {'fixed-demo'},
+        )
+        self.assertEqual(len(metadata['boundary_diagnostics']), 3)
 
     def test_result_package_binds_query_and_records_runtime_policy(self):
         query = _query()

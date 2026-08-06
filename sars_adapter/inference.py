@@ -9,6 +9,12 @@ import torch
 
 from lib.data.dataset import skel_to_h36m
 from lib.utils.tools import get_config, read_pkl
+from sars_adapter.coordinate_adapter import (
+    TRANSFORM_MODE,
+    inverse_project_h36m17_window,
+    prepare_project_h36m17_sample,
+    project_to_sic_joints,
+)
 from sars_adapter.windowing import (
     analyze_mask_compatibility,
     f64_windows,
@@ -24,7 +30,9 @@ def _sha256_file(path):
     return digest.hexdigest()
 
 
-def build_train_prompt_provider(data_root, source_config, seed=42):
+def build_train_prompt_provider(
+    data_root, source_config, seed=42, selection_policy='per_window'
+):
     """从官方 3DPW_MC/train 稳定选择 demonstration。"""
     train_dir = os.path.join(os.path.abspath(data_root), '3DPW_MC', 'train')
     if not os.path.isdir(train_dir):
@@ -38,9 +46,14 @@ def build_train_prompt_provider(data_root, source_config, seed=42):
         raise ValueError('3DPW_MC/train contains no demonstration files')
     args = get_config(source_config)
     joint_map = args.amass_to_h36m
+    if selection_policy not in {'per_window', 'per_sample_fixed'}:
+        raise ValueError('unsupported demonstration selection_policy')
 
     def provider(sample_index, window_index, window_mask):
-        token = '{}:{}:{}'.format(int(seed), sample_index, window_index)
+        if selection_policy == 'per_sample_fixed':
+            token = '{}:{}'.format(int(seed), sample_index)
+        else:
+            token = '{}:{}:{}'.format(int(seed), sample_index, window_index)
         index = int.from_bytes(
             hashlib.sha256(token.encode('utf-8')).digest()[:8], 'big'
         ) % len(files)
@@ -61,6 +74,7 @@ def build_train_prompt_provider(data_root, source_config, seed=42):
             'identity': os.path.basename(path),
             'sha256': _sha256_file(path),
             'selection_seed': int(seed),
+            'selection_policy': selection_policy,
         }
         return (
             np.asarray(prompt_input, dtype=np.float32),
@@ -71,7 +85,7 @@ def build_train_prompt_provider(data_root, source_config, seed=42):
     return provider
 
 
-def _prompt_arrays(prompt_provider, sample_index, window_index, window_mask):
+def _raw_prompt_arrays(prompt_provider, sample_index, window_index, window_mask):
     prompt_input, prompt_target, metadata = prompt_provider(
         sample_index, window_index, window_mask
     )
@@ -82,8 +96,39 @@ def _prompt_arrays(prompt_provider, sample_index, window_index, window_mask):
     metadata = dict(metadata or {})
     if metadata.get('source_split') != 'train':
         raise ValueError('SiC demonstrations must come from train split')
+    return prompt_input, prompt_target, metadata
+
+
+def _prompt_arrays(prompt_provider, sample_index, window_index, window_mask):
+    prompt_input, prompt_target, metadata = _raw_prompt_arrays(
+        prompt_provider, sample_index, window_index, window_mask
+    )
     masked_prompt = np.where(window_mask[..., None], 0.0, prompt_input)
     return masked_prompt, prompt_target, metadata
+
+
+def _boundary_diagnostics(completed):
+    records = []
+    for sample_index in range(completed.shape[0]):
+        sample = completed[sample_index]
+        for boundary in (16, 32, 48):
+            position_jump = np.linalg.norm(
+                sample[boundary] - sample[boundary - 1], axis=-1
+            )
+            velocity_before = sample[boundary - 1] - sample[boundary - 2]
+            velocity_after = sample[boundary + 1] - sample[boundary]
+            velocity_jump = np.linalg.norm(
+                velocity_after - velocity_before, axis=-1
+            )
+            records.append({
+                'sample_index': int(sample_index),
+                'boundary_frame': int(boundary),
+                'position_jump_mean': float(np.mean(position_jump)),
+                'position_jump_max': float(np.max(position_jump)),
+                'velocity_jump_mean': float(np.mean(velocity_jump)),
+                'velocity_jump_max': float(np.max(velocity_jump)),
+            })
+    return records
 
 
 def complete_f64_with_model(
@@ -93,6 +138,7 @@ def complete_f64_with_model(
     prompt_provider,
     device='cuda:0',
     mask_policy='allow_ood_explicit',
+    coordinate_transform_mode='identity_h36m17',
 ):
     """按四个非重叠 F16 窗口补全，并精确恢复全部可见关节。"""
     masked = np.asarray(masked_keypoint, dtype=np.float32)
@@ -103,6 +149,8 @@ def complete_f64_with_model(
         raise ValueError('missing_mask must be (samples,64,17)')
     if mask_policy not in {'strict_official_mc', 'allow_ood_explicit'}:
         raise ValueError('unsupported mask_policy')
+    if coordinate_transform_mode not in {'identity_h36m17', TRANSFORM_MODE}:
+        raise ValueError('unsupported coordinate_transform_mode')
     if not np.isfinite(masked).all():
         raise ValueError('masked_keypoint must contain finite values')
 
@@ -111,9 +159,33 @@ def complete_f64_with_model(
     model.eval()
     completed = np.array(masked, copy=True)
     window_records = []
+    sample_transforms = []
     demonstration_splits = set()
     for sample_index in range(masked.shape[0]):
-        compatibility = analyze_mask_compatibility(missing[sample_index])
+        formal_mode = coordinate_transform_mode == TRANSFORM_MODE
+        if formal_mode:
+            first_model_mask = np.asarray(
+                project_to_sic_joints(missing[sample_index, :16]), dtype=bool
+            )
+            prompt_input_raw, prompt_target_raw, prompt_metadata = (
+                _raw_prompt_arrays(
+                    prompt_provider, sample_index, 0, first_model_mask
+                )
+            )
+            query_f64, model_missing, transform_state, transform_metadata = (
+                prepare_project_h36m17_sample(
+                    masked[sample_index], missing[sample_index], prompt_input_raw
+                )
+            )
+            sample_transforms.append(transform_metadata)
+        else:
+            query_f64 = masked[sample_index]
+            model_missing = missing[sample_index]
+            transform_state = None
+            prompt_input_raw = None
+            prompt_target_raw = None
+            prompt_metadata = None
+        compatibility = analyze_mask_compatibility(model_missing)
         if (
             mask_policy == 'strict_official_mc'
             and not compatibility['official_mc_compatible']
@@ -124,12 +196,18 @@ def complete_f64_with_model(
                 )
             )
         for window_index, (start, end) in enumerate(f64_windows()):
-            window_mask = missing[sample_index, start:end]
-            prompt_input, prompt_target, prompt_metadata = _prompt_arrays(
-                prompt_provider, sample_index, window_index, window_mask
-            )
+            window_mask = model_missing[start:end]
+            if formal_mode:
+                prompt_input = np.where(
+                    window_mask[..., None], 0.0, prompt_input_raw
+                )
+                prompt_target = prompt_target_raw
+            else:
+                prompt_input, prompt_target, prompt_metadata = _prompt_arrays(
+                    prompt_provider, sample_index, window_index, window_mask
+                )
             demonstration_splits.add(prompt_metadata['source_split'])
-            query_input = masked[sample_index, start:end]
+            query_input = query_f64[start:end]
             prompt = np.concatenate([prompt_input, prompt_target], axis=0)
             query = np.concatenate(
                 [query_input, np.zeros_like(query_input)], axis=0
@@ -141,8 +219,17 @@ def complete_f64_with_model(
             generated = prediction.detach().cpu().numpy()[0]
             if generated.shape != (16, 17, 3) or not np.isfinite(generated).all():
                 raise ValueError('SiC prediction must be finite (16,17,3)')
+            if formal_mode:
+                generated = inverse_project_h36m17_window(
+                    generated, transform_state, start, end
+                )
+                restore_input = masked[sample_index, start:end]
+                restore_mask = missing[sample_index, start:end]
+            else:
+                restore_input = query_input
+                restore_mask = window_mask
             completed[sample_index, start:end] = restore_observed_joints(
-                query_input, generated, window_mask
+                restore_input, generated, restore_mask
             )
             window_records.append({
                 'sample_index': sample_index,
@@ -159,6 +246,9 @@ def complete_f64_with_model(
         'window_policy': 'non_overlapping_f16',
         'windows': window_records,
         'mask_policy': mask_policy,
+        'coordinate_transform_mode': coordinate_transform_mode,
+        'sample_transforms': sample_transforms,
+        'boundary_diagnostics': _boundary_diagnostics(completed),
         'missing_mask_semantics': 'True=missing',
         'demonstration_source_splits': sorted(demonstration_splits),
         'observed_restoration_max_abs_error': observed_error,
