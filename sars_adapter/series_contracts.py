@@ -9,6 +9,7 @@ import math
 import ntpath
 import os
 import posixpath
+import re
 from collections.abc import Mapping, Sequence
 
 from sars_adapter.contracts import load_completion_query
@@ -130,6 +131,14 @@ def validate_run_plan(plan):
     if method_profile.get('method_name') != method_name:
         raise ValueError('run-plan method_profile must use canonical text')
     method_profile['method_name'] = method_name
+    checkpoint_sha256 = str(
+        method_profile.get('checkpoint_sha256') or ''
+    ).strip().lower()
+    if not re.fullmatch(r'[0-9a-f]{64}', checkpoint_sha256):
+        raise ValueError(
+            'run-plan method_profile.checkpoint_sha256 must be a 64-character SHA256'
+        )
+    method_profile['checkpoint_sha256'] = checkpoint_sha256
 
     seen_ids = set()
     seen_results = set()

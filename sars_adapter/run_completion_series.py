@@ -211,6 +211,18 @@ def _validate_plan_runtime_profile(method_profile, provenance):
                     label, expected_value, actual_value
                 )
             )
+    expected_checkpoint = str(
+        method_profile.get('checkpoint_sha256') or ''
+    ).strip().lower()
+    actual_checkpoint = str(
+        provenance['checkpoint'].get('sha256') or ''
+    ).strip().lower()
+    if expected_checkpoint != actual_checkpoint:
+        raise ValueError(
+            'run-plan checkpoint mismatch: expected={}, runtime={}'.format(
+                expected_checkpoint, actual_checkpoint
+            )
+        )
 
 
 def run_completion_series(config, completion_runner=run_completion):

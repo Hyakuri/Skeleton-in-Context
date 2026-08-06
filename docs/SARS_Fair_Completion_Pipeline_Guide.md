@@ -82,6 +82,11 @@ Run:
 
 Run the custom dataset and NW-UCLA separately. Change only query/output paths. Keep checkpoint, source config, data root, seed, mask policy, prompt policy, and coordinate mode identical.
 
+The public run plan must contain
+`method_profile.checkpoint_sha256`. It must be the exact 64-character SHA256 of
+`checkpoint_path`; the series runner rejects a missing or mismatched identity
+before loading the model.
+
 ## 3. Import The Result In SARS-Inter
 
 Configure `src/PP_ImportExternalCompletionResults.py` with the source masked dataset, public query, private sidecar, SiC result, `source_split=test`, and `generated_split_name=generated_test`.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -109,6 +110,9 @@ class CompletionSeriesTest(unittest.TestCase):
             'upstream_repository_commit': (
                 '361e1c0b9552baa8510e00dbb33629debfd66873'
             ),
+            'checkpoint_sha256': hashlib.sha256(
+                b'checkpoint-for-series-test'
+            ).hexdigest(),
         }
 
     def _write_plan(self, jobs):
@@ -265,6 +269,21 @@ class CompletionSeriesTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, 'upstream.*commit'):
             run_completion_series(self._config(plan_path))
+
+    def test_execution_rejects_plan_for_different_checkpoint_before_model_load(self):
+        plan_path, plan = self._write_plan([self._job('wrong-checkpoint')])
+        plan['method_profile']['checkpoint_sha256'] = '0' * 64
+        plan = build_run_plan(plan['jobs'], plan['method_profile'])
+        with open(plan_path, 'w', encoding='utf-8') as stream:
+            json.dump(plan, stream, ensure_ascii=False, indent=2)
+
+        with self.assertRaisesRegex(ValueError, 'checkpoint'):
+            run_completion_series(
+                self._config(plan_path),
+                completion_runner=mock.Mock(
+                    side_effect=AssertionError('completion must not start')
+                ),
+            )
 
     def test_dry_run_does_not_load_model(self):
         plan_path, _ = self._write_plan([self._job('dry')])

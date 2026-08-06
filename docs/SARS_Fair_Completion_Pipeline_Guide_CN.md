@@ -9,6 +9,10 @@
 自获数据集和 NW-UCLA 使用同一个冻结 SiC checkpoint、同一套 train-only
 demonstration、同一坐标适配和同一推理参数；HAR checkpoint 仍按数据集分别使用。
 
+公开 run plan 必须包含 `method_profile.checkpoint_sha256`，并与
+`checkpoint_path` 文件的 64 位 SHA256 完全一致。缺失或不一致时，series runner
+会在加载模型前停止。
+
 ```text
 SARS-Inter masked dataset
   -> 公开 completion_query.pkl 与公开 run plan
