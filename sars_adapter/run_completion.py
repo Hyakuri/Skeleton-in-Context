@@ -41,7 +41,8 @@ def build_direct_run_config():
         'require_clean_repository': True,  # True=正式补值只允许无未提交改动的仓库。
         'query_path': '<COMPLETION_QUERY_PATH>',  # SARS-Inter V2 query，不得传评价 sidecar。
         'checkpoint_path': '<SIC_CHECKPOINT_PATH>',  # SiC latest/best checkpoint。
-        'source_config': os.path.join(PROJECT_ROOT, 'configs', 'default.yaml'),  # 训练使用的官方基础配置。
+        'source_config': '<SIC_EFFECTIVE_CONFIG_PATH>',  # 必须填写与 checkpoint 同 run 的 effective_config.yaml，避免任务范围记录错误。
+        'checkpoint_identity_policy': 'require_mc_only',  # require_mc_only=正式实验仅接受同配置的 MC-only checkpoint；allow_legacy=仅兼容旧冒烟权重。
         'data_root': '<SIC_DATA_ROOT>',  # 包含 3DPW_MC/train 的官方数据根目录。
         'output_path': '<COMPLETION_RESULT_PATH>',  # 返回 SARS-Inter 的 V2 result pkl。
         'device': 'cuda:0',  # 可选 cuda:0 或 cpu。
@@ -94,6 +95,44 @@ def _sha256_file(path):
         for chunk in iter(lambda: stream.read(1024 * 1024), b''):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def validate_completion_checkpoint_identity(
+    checkpoint, source_config, policy='require_mc_only'
+):
+    """校验补值 checkpoint 与训练配置、任务范围是否一致。"""
+    policy = str(policy or 'require_mc_only')
+    if policy not in {'require_mc_only', 'allow_legacy'}:
+        raise ValueError('unsupported checkpoint identity policy')
+
+    identity = checkpoint.get('training_identity')
+    if identity is None:
+        if policy == 'require_mc_only':
+            raise ValueError(
+                'formal completion checkpoint is missing training identity'
+            )
+        return None
+    if not isinstance(identity, dict):
+        raise ValueError('checkpoint training identity must be a dict')
+
+    expected_config_hash = str(
+        identity.get('effective_config_sha256') or ''
+    ).lower()
+    actual_config_hash = _sha256_file(source_config).lower()
+    if expected_config_hash != actual_config_hash:
+        raise ValueError(
+            'checkpoint source config hash does not match source_config'
+        )
+
+    if policy == 'require_mc_only':
+        if (
+            list(identity.get('tasks') or []) != ['MC']
+            or identity.get('task_scope') != 'single_task'
+        ):
+            raise ValueError(
+                'formal completion requires an MC-only single-task checkpoint'
+            )
+    return copy.deepcopy(identity)
 
 
 def _update_length_prefixed(digest, value):
@@ -235,7 +274,13 @@ def _repository_identity():
     return commit, bool(tracked_diff or untracked_paths), digest.hexdigest()
 
 
-def _load_model(source_config, data_root, checkpoint_path, device):
+def _load_model(
+    source_config,
+    data_root,
+    checkpoint_path,
+    device,
+    checkpoint_identity_policy='require_mc_only',
+):
     args = get_config(source_config)
     args.full_data.root_path = data_root
     args.use_partial_data = False
@@ -244,11 +289,18 @@ def _load_model(source_config, data_root, checkpoint_path, device):
         raise ValueError('SARS adapter currently supports SiC_dynamicTUP checkpoint')
     model = load_backbone(args)
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    training_identity = validate_completion_checkpoint_identity(
+        checkpoint,
+        source_config,
+        policy=checkpoint_identity_policy,
+    )
     state = checkpoint['model_pos']
     if state and all(key.startswith('module.') for key in state):
         state = {key[7:]: value for key, value in state.items()}
     model.load_state_dict(state, strict=True)
-    return model.to(torch.device(device))
+    model = model.to(torch.device(device))
+    model.sars_training_identity = training_identity
+    return model
 
 
 def _resolve_runtime_paths(config):
@@ -264,6 +316,13 @@ def _resolve_runtime_paths(config):
     if not os.path.isdir(resolved['data_root']):
         raise FileNotFoundError(resolved['data_root'])
     resolved['device'] = str(resolved.get('device') or 'cuda:0')
+    resolved['checkpoint_identity_policy'] = str(
+        resolved.get('checkpoint_identity_policy') or 'require_mc_only'
+    )
+    if resolved['checkpoint_identity_policy'] not in {
+        'require_mc_only', 'allow_legacy'
+    }:
+        raise ValueError('unsupported checkpoint identity policy')
     resolved['require_clean_repository'] = bool(
         resolved.get('require_clean_repository', True)
     )
@@ -294,6 +353,9 @@ def _completion_policy(resolved):
             resolved['demonstration_selection_policy']
         ),
         'observed_joint_policy': 'exact_restore',
+        'checkpoint_identity_policy': str(
+            resolved['checkpoint_identity_policy']
+        ),
     }
 
 
@@ -308,6 +370,7 @@ def prepare_completion_runtime(config, runtime=None, load_model=True):
         resolved['demonstration_selection_policy'],
         int(resolved.get('demonstration_seed', 42)),
         str(resolved.get('mask_policy', 'allow_ood_explicit')),
+        resolved['checkpoint_identity_policy'],
         bool(resolved['require_clean_repository']),
     )
     previous = shared.get('runtime_signature')
@@ -331,6 +394,19 @@ def prepare_completion_runtime(config, runtime=None, load_model=True):
         shared['checkpoint_sha256'] = _sha256_file(
             resolved['checkpoint_path']
         )
+    if (
+        not load_model
+        and resolved['checkpoint_identity_policy'] == 'require_mc_only'
+        and 'checkpoint_training_identity' not in shared
+    ):
+        checkpoint = torch.load(resolved['checkpoint_path'], map_location='cpu')
+        shared['checkpoint_training_identity'] = (
+            validate_completion_checkpoint_identity(
+                checkpoint,
+                resolved['source_config'],
+                policy=resolved['checkpoint_identity_policy'],
+            )
+        )
     if 'provenance' not in shared:
         commit, dirty, worktree_hash = shared['repository_identity']
         prompt_pool = shared['prompt_pool']
@@ -347,6 +423,9 @@ def prepare_completion_runtime(config, runtime=None, load_model=True):
             },
             'checkpoint': {
                 'sha256': shared['checkpoint_sha256'],
+                'training_identity': copy.deepcopy(
+                    shared.get('checkpoint_training_identity')
+                ),
             },
             'prompt_pool': {
                 'manifest_sha256': prompt_pool[
@@ -362,7 +441,16 @@ def prepare_completion_runtime(config, runtime=None, load_model=True):
     if load_model and 'model' not in shared:
         shared['model'] = _load_model(
             resolved['source_config'], resolved['data_root'],
-            resolved['checkpoint_path'], resolved['device']
+            resolved['checkpoint_path'], resolved['device'],
+            checkpoint_identity_policy=resolved[
+                'checkpoint_identity_policy'
+            ],
+        )
+        shared['checkpoint_training_identity'] = copy.deepcopy(
+            getattr(shared['model'], 'sars_training_identity', None)
+        )
+        shared['provenance']['checkpoint']['training_identity'] = copy.deepcopy(
+            shared['checkpoint_training_identity']
         )
         if _sha256_file(resolved['checkpoint_path']) != shared['checkpoint_sha256']:
             raise RuntimeError('SiC checkpoint changed while loading the model')

@@ -32,7 +32,8 @@ Edit `build_direct_run_config()` in `sars_adapter/run_completion.py`:
 - `dry_run`: validate paths/query only or run inference.
 - `query_path`: V2 `completion_query.pkl`; never point this to the private sidecar.
 - `checkpoint_path`: frozen SiC checkpoint.
-- `source_config`: training-compatible SiC YAML.
+- `source_config`: the run-specific `effective_config.yaml` matching the checkpoint; MC-only training must preserve `tasks: [MC]`.
+- `checkpoint_identity_policy`: use `require_mc_only` for formal experiments. It rejects legacy checkpoints, multi-task checkpoints, and a `source_config` whose SHA256 differs from the checkpoint training identity. `allow_legacy` exists only to reproduce old smoke checkpoints and must not be used for paper results.
 - `data_root`: official data root containing `3DPW_MC/train`.
 - `output_path`: V2 `completion_result.pkl` returned to SARS-Inter.
 - `device`: `cuda:0` or `cpu`.
@@ -61,7 +62,7 @@ The query coordinate contract must explicitly declare `joint_order=h36m17_sars_i
 4. Align the query to the selected train demonstration, run four F16 windows, and inverse-transform the output.
 5. Restore every observed project-space coordinate exactly.
 
-The result records the permutation, axis matrix, root hashes, sample/reference scales, prompt identity/hash, prompt-pool manifest hash/count, source-config hash, missing-joint boundary diagnostics, repository identity, and checkpoint SHA256. Prompt selection uses a stable hash of `masked_keypoint + missing_mask`; it never parses sample IDs, labels, or dataset names.
+The result records the permutation, axis matrix, root hashes, sample/reference scales, prompt identity/hash, prompt-pool manifest hash/count, source-config hash, checkpoint training identity, missing-joint boundary diagnostics, repository identity, and checkpoint SHA256. Prompt selection uses a stable hash of `masked_keypoint + missing_mask`; it never parses sample IDs, labels, or dataset names.
 
 ## Custom And NW-UCLA Runs
 

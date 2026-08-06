@@ -27,10 +27,8 @@ def build_direct_run_config():
         'plan_path': '<PUBLIC_RUN_PLAN_JSON>',  # 仅含公开 query job 的 V1 plan。
         'output_root': '<COMPLETION_RESULT_ROOT>',  # 所有相对结果路径的安全根目录。
         'checkpoint_path': '<SIC_CHECKPOINT_PATH>',  # 冻结的 SiC checkpoint。
-        'source_config': os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            'configs', 'default.yaml',
-        ),  # 与 checkpoint 对应的官方模型配置。
+        'source_config': '<SIC_EFFECTIVE_CONFIG_PATH>',  # 必须填写与 checkpoint 同 run 的 effective_config.yaml，避免任务范围记录错误。
+        'checkpoint_identity_policy': 'require_mc_only',  # require_mc_only=正式实验仅接受同配置的 MC-only checkpoint；allow_legacy=仅兼容旧冒烟权重。
         'data_root': '<SIC_DATA_ROOT>',  # 只读取 3DPW_MC/train demonstrations。
         'device': 'cuda:0',  # 可填写 cuda:0 或 cpu。
         'dry_run': True,  # True=只校验 plan 并记录 planned，不加载模型。

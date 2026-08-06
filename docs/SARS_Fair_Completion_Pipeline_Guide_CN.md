@@ -65,7 +65,8 @@ external_completion_export/
 | `plan_path` | SARS-Inter 生成的 `external_completion_run_plan.json`。 |
 | `output_root` | 结果根目录；每个 job 按 plan 的 `result_relative_path` 保存。 |
 | `checkpoint_path` | 冻结 SiC checkpoint 的完整路径。 |
-| `source_config` | 与 checkpoint 对应的官方 YAML，通常为 `configs/default.yaml`。 |
+| `source_config` | 与 checkpoint 同 run 的 `effective_config.yaml`；正式 MC-only checkpoint 不应改回仓库默认 YAML。 |
+| `checkpoint_identity_policy` | 正式运行填写 `require_mc_only`；`allow_legacy` 只兼容旧冒烟 checkpoint，不得用于论文结果。 |
 | `data_root` | SiC 数据根目录，必须包含 train-only demonstration pool。 |
 | `device` | 通常为 `cuda:0`；CPU 仅适合接口测试。 |
 | `dry_run` | `True` 只校验 plan 且不加载模型；`False` 运行真实 GPU 推理。 |

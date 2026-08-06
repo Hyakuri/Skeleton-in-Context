@@ -1,4 +1,4 @@
-"""使用官方四任务数据执行可审计的 SiC 子集训练。"""
+"""使用选定官方任务数据执行可审计的 SiC 单任务或多任务训练。"""
 
 from __future__ import annotations
 
@@ -31,27 +31,24 @@ OFFICIAL_DATASETS = {
 def build_direct_run_config():
     """集中放置需要手动调整的训练参数。"""
     return {
-        'dry_run': False,  # True=只检查并打印配置；False=开始真实 GPU 训练。
+        'dry_run': True,  # True=只检查并打印配置；False=开始真实 GPU 训练。
         'source_config': os.path.join(PROJECT_ROOT, 'configs', 'default.yaml'),  # 官方基础配置。
-        'data_root': r'K:\ExternalCompletionBaselines\Skeleton-in-Context\data',  # 官方 ready-to-use 数据根目录，必须包含四任务目录。
+        'data_root': r'K:\ExternalCompletionBaselines\Skeleton-in-Context\data',  # 官方 ready-to-use 数据根目录；只要求当前启用任务的目录存在。
         'checkpoint_root': r'K:\ExternalCompletionBaselines\Skeleton-in-Context\checkpoints',  # checkpoint 与训练 manifest 输出根目录。
-        'run_name': 'sic_subset_{timestamp}',  # 支持 {timestamp}，用于区分每次训练。
-        'tasks': list(OFFICIAL_TASKS),  # 保持官方 PE/MP/MC/FPE 四任务训练。
-        'train_sample_limits': {  # 每个任务稳定抽取的训练样本数；None 表示该任务使用全部训练数据。
-            'PE': 1000,
-            'MP': 1000,
-            'MC': 1000,
-            'FPE': 1000,
+        'run_name': 'sic_mc_{timestamp}',  # 支持 {timestamp}；建议在名称中记录本次任务范围。
+        'tasks': ['MC'],  # 可填写官方任务的有序子集；本项目补值基线推荐只使用 MC（论文中的 Joint Completion）。
+        'train_sample_limits': {  # 只填写当前启用任务；None=使用该任务全部训练数据，整数=确定性抽取指定数量。
+            'MC': None,
         },
         'subset_seed': 42,  # 控制各任务文件子集选择，写入 training_subset_manifest.json。
         'epochs': 120,  # 子集正式训练 epoch 数；首次运行建议先改为 1。
         'batch_size': 32,  # 单 GPU 物理 batch size；正式值应由本机 smoke test 决定。
         'test_batch_size': 256,  # 最终官方任务评价 batch size。
         'learning_rate': 0.0002,  # 沿用官方初始学习率。
-        'num_workers': 0,  # Windows 首次 smoke 建议 0；稳定后可尝试 2 或 4。
+        'num_workers': 0,  # Windows 首次 smoke 建议 0；正式训练可尝试 2 或 4，但必须关闭 persistent_workers。
         'pin_memory': True,  # CUDA 训练时锁页内存开关。
         'prefetch_factor': 2,  # 仅 num_workers>0 时生效。
-        'persistent_workers': True,  # 仅 num_workers>0 时生效。
+        'persistent_workers': False,  # 严格可恢复训练必须为 False，确保每个 epoch 重新派生确定性 worker seed。
         'no_eval': True,  # 子集训练期间跳过昂贵评价；完成后再用官方 evaluate 单独评价。
         'seed': 42,  # 模型初始化、DataLoader 与训练随机性的主 seed。
     }
@@ -80,14 +77,29 @@ def _require_real_path(path, field_name):
 def resolve_training_config(config):
     resolved = copy.deepcopy(dict(config))
     resolved['tasks'] = [str(task) for task in resolved.get('tasks', [])]
-    if resolved['tasks'] != OFFICIAL_TASKS:
-        raise ValueError(f'tasks must remain the official order {OFFICIAL_TASKS}')
+    if not resolved['tasks']:
+        raise ValueError('tasks must contain at least one official task')
+    unsupported = [task for task in resolved['tasks'] if task not in OFFICIAL_TASKS]
+    if unsupported:
+        raise ValueError(f'unsupported tasks: {unsupported}; supported={OFFICIAL_TASKS}')
+    if len(set(resolved['tasks'])) != len(resolved['tasks']):
+        raise ValueError('tasks must not contain duplicates')
+    expected_order = [task for task in OFFICIAL_TASKS if task in resolved['tasks']]
+    if resolved['tasks'] != expected_order:
+        raise ValueError(f'tasks must follow the official order {OFFICIAL_TASKS}')
     limits = resolved.get('train_sample_limits') or {}
-    if set(limits) != set(OFFICIAL_TASKS):
-        raise ValueError('train_sample_limits must define all four official tasks')
+    if set(limits) != set(resolved['tasks']):
+        raise ValueError('train_sample_limits must define exactly the active tasks')
     for task, limit in limits.items():
         if limit is not None and int(limit) <= 0:
             raise ValueError(f'train_sample_limits[{task}] must be positive or None')
+    if (
+        int(resolved.get('num_workers', 0)) > 0
+        and bool(resolved.get('persistent_workers', False))
+    ):
+        raise ValueError(
+            'persistent_workers must be False for strict resumable training'
+        )
     resolved['source_config'] = _require_real_path(
         resolved['source_config'], 'source_config'
     )
@@ -101,11 +113,15 @@ def resolve_training_config(config):
     )
     if not os.path.isfile(resolved['source_config']):
         raise FileNotFoundError(resolved['source_config'])
-    for task, folder in OFFICIAL_DATASETS.items():
+    for task in resolved['tasks']:
+        folder = OFFICIAL_DATASETS[task]
         for split in ('train', 'test'):
             path = os.path.join(resolved['data_root'], folder, split)
             if not os.path.isdir(path):
                 raise FileNotFoundError(f'missing official {task}/{split}: {path}')
+    resolved['task_scope'] = (
+        'single_task' if len(resolved['tasks']) == 1 else 'multi_task'
+    )
     return resolved
 
 
@@ -126,6 +142,8 @@ def build_effective_args(config):
     args.prefetch_factor = int(config['prefetch_factor'])
     args.persistent_workers = bool(config['persistent_workers'])
     args.no_eval = bool(config['no_eval'])
+    args.seed = int(config['seed'])
+    args.strict_training_identity = True
     return args
 
 
@@ -135,6 +153,7 @@ def run_subset_training(config):
     preview = {
         'status': 'planned' if resolved.get('dry_run', True) else 'running',
         'checkpoint_dir': resolved['checkpoint_dir'],
+        'task_scope': resolved['task_scope'],
         'tasks': list(args.tasks),
         'train_sample_limits': _plain(args.train_sample_limits),
         'epochs': int(args.epochs),

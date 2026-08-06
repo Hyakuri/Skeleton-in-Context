@@ -36,8 +36,9 @@ class MotionDataset(Dataset):
             assert prompt_list is None
         if data_split == 'test':
             assert prompt_list is not None
-        np.random.seed(0)
-        random.seed(0)
+        training_seed = int(args.get('seed', 0))
+        np.random.seed(training_seed)
+        random.seed(training_seed)
         self.data_split = data_split    # 'train' or 'test'
         self.is_train_dataset = (True if data_split == 'train' else False)
         query_list = []

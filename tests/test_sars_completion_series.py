@@ -11,6 +11,7 @@ import unittest
 from unittest import mock
 
 import numpy as np
+import torch
 
 from sars_adapter.contracts import _query_hash
 from sars_adapter.run_completion import _package_hash, _repository_identity
@@ -96,8 +97,9 @@ class CompletionSeriesTest(unittest.TestCase):
             'expected_sample_count': 1,
         }
 
-    @staticmethod
-    def _method_profile():
+    def _method_profile(self):
+        with open(self.checkpoint_path, 'rb') as stream:
+            checkpoint_sha256 = hashlib.sha256(stream.read()).hexdigest()
         return {
             'method_name': 'skeleton_in_context',
             'repository_url': (
@@ -110,9 +112,7 @@ class CompletionSeriesTest(unittest.TestCase):
             'upstream_repository_commit': (
                 '361e1c0b9552baa8510e00dbb33629debfd66873'
             ),
-            'checkpoint_sha256': hashlib.sha256(
-                b'checkpoint-for-series-test'
-            ).hexdigest(),
+            'checkpoint_sha256': checkpoint_sha256,
         }
 
     def _write_plan(self, jobs):
@@ -130,6 +130,7 @@ class CompletionSeriesTest(unittest.TestCase):
             'output_root': self.output_root,
             'checkpoint_path': self.checkpoint_path,
             'source_config': self.source_config,
+            'checkpoint_identity_policy': 'allow_legacy',
             'data_root': self.data_root,
             'device': 'cpu',
             'dry_run': False,
@@ -144,6 +145,43 @@ class CompletionSeriesTest(unittest.TestCase):
         }
         config.update(overrides)
         return config
+
+    def test_formal_preflight_rejects_legacy_checkpoint_before_runner(self):
+        torch.save({'model_pos': {}}, self.checkpoint_path)
+        plan_path, _ = self._write_plan([self._job('legacy-identity')])
+        runner = mock.Mock(side_effect=AssertionError('runner must not start'))
+        with self.assertRaisesRegex(ValueError, 'training identity'):
+            run_completion_series(
+                self._config(
+                    plan_path,
+                    checkpoint_identity_policy='require_mc_only',
+                ),
+                completion_runner=runner,
+            )
+        runner.assert_not_called()
+
+    def test_formal_preflight_rejects_wrong_effective_config(self):
+        torch.save({
+            'training_identity': {
+                'format': 'skeleton_in_context_training_identity',
+                'version': 1,
+                'tasks': ['MC'],
+                'task_scope': 'single_task',
+                'effective_config_sha256': '0' * 64,
+            },
+            'model_pos': {},
+        }, self.checkpoint_path)
+        plan_path, _ = self._write_plan([self._job('wrong-config')])
+        runner = mock.Mock(side_effect=AssertionError('runner must not start'))
+        with self.assertRaisesRegex(ValueError, 'source config'):
+            run_completion_series(
+                self._config(
+                    plan_path,
+                    checkpoint_identity_policy='require_mc_only',
+                ),
+                completion_runner=runner,
+            )
+        runner.assert_not_called()
 
     @staticmethod
     def _fake_prompt_provider(selection_records):
