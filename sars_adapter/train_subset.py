@@ -31,10 +31,10 @@ OFFICIAL_DATASETS = {
 def build_direct_run_config():
     """集中放置需要手动调整的训练参数。"""
     return {
-        'dry_run': True,  # True=只检查并打印配置；False=开始真实 GPU 训练。
+        'dry_run': False,  # True=只检查并打印配置；False=开始真实 GPU 训练。
         'source_config': os.path.join(PROJECT_ROOT, 'configs', 'default.yaml'),  # 官方基础配置。
-        'data_root': '<SIC_DATA_ROOT>',  # 官方 ready-to-use 数据根目录，必须包含四任务目录。
-        'checkpoint_root': '<SIC_CHECKPOINT_ROOT>',  # checkpoint 与训练 manifest 输出根目录。
+        'data_root': r'K:\ExternalCompletionBaselines\Skeleton-in-Context\data',  # 官方 ready-to-use 数据根目录，必须包含四任务目录。
+        'checkpoint_root': r'K:\ExternalCompletionBaselines\Skeleton-in-Context\checkpoints',  # checkpoint 与训练 manifest 输出根目录。
         'run_name': 'sic_subset_{timestamp}',  # 支持 {timestamp}，用于区分每次训练。
         'tasks': list(OFFICIAL_TASKS),  # 保持官方 PE/MP/MC/FPE 四任务训练。
         'train_sample_limits': {  # 每个任务稳定抽取的训练样本数；None 表示该任务使用全部训练数据。
