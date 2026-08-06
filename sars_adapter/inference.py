@@ -31,7 +31,8 @@ def _sha256_file(path):
 
 
 def build_train_prompt_provider(
-    data_root, source_config, seed=42, selection_policy='per_window'
+    data_root, source_config, seed=42, selection_policy='per_window',
+    selection_keys=None,
 ):
     """从官方 3DPW_MC/train 稳定选择 demonstration。"""
     train_dir = os.path.join(os.path.abspath(data_root), '3DPW_MC', 'train')
@@ -48,10 +49,27 @@ def build_train_prompt_provider(
     joint_map = args.amass_to_h36m
     if selection_policy not in {'per_window', 'per_sample_fixed'}:
         raise ValueError('unsupported demonstration selection_policy')
+    if selection_keys is not None:
+        selection_keys = [str(value) for value in selection_keys]
+    pool_digest = hashlib.sha256()
+    for path in files:
+        record = '{}\0{}'.format(
+            os.path.basename(path), os.path.getsize(path)
+        ).encode('utf-8')
+        pool_digest.update(len(record).to_bytes(8, 'big'))
+        pool_digest.update(record)
+    pool_hash = pool_digest.hexdigest()
+    source_config_hash = _sha256_file(source_config)
 
     def provider(sample_index, window_index, window_mask):
         if selection_policy == 'per_sample_fixed':
-            token = '{}:{}'.format(int(seed), sample_index)
+            if selection_keys is not None:
+                if sample_index >= len(selection_keys):
+                    raise IndexError('demonstration selection key is missing')
+                selection_key = selection_keys[sample_index]
+            else:
+                selection_key = str(sample_index)
+            token = '{}:{}'.format(int(seed), selection_key)
         else:
             token = '{}:{}:{}'.format(int(seed), sample_index, window_index)
         index = int.from_bytes(
@@ -75,6 +93,12 @@ def build_train_prompt_provider(
             'sha256': _sha256_file(path),
             'selection_seed': int(seed),
             'selection_policy': selection_policy,
+            'selection_key_sha256': hashlib.sha256(
+                token.encode('utf-8')
+            ).hexdigest(),
+            'prompt_pool_file_count': int(len(files)),
+            'prompt_pool_manifest_sha256': pool_hash,
+            'source_config_sha256': source_config_hash,
         }
         return (
             np.asarray(prompt_input, dtype=np.float32),
@@ -107,7 +131,7 @@ def _prompt_arrays(prompt_provider, sample_index, window_index, window_mask):
     return masked_prompt, prompt_target, metadata
 
 
-def _boundary_diagnostics(completed):
+def _boundary_diagnostics(completed, missing_mask):
     records = []
     for sample_index in range(completed.shape[0]):
         sample = completed[sample_index]
@@ -120,14 +144,40 @@ def _boundary_diagnostics(completed):
             velocity_jump = np.linalg.norm(
                 velocity_after - velocity_before, axis=-1
             )
-            records.append({
+            missing_joints = np.any(
+                missing_mask[
+                    sample_index, boundary - 2:boundary + 2
+                ],
+                axis=0,
+            )
+            missing_position = position_jump[missing_joints]
+            missing_velocity = velocity_jump[missing_joints]
+            record = {
                 'sample_index': int(sample_index),
                 'boundary_frame': int(boundary),
                 'position_jump_mean': float(np.mean(position_jump)),
                 'position_jump_max': float(np.max(position_jump)),
                 'velocity_jump_mean': float(np.mean(velocity_jump)),
                 'velocity_jump_max': float(np.max(velocity_jump)),
-            })
+                'missing_joint_count': int(np.sum(missing_joints)),
+                'missing_position_jump_mean': (
+                    float(np.mean(missing_position))
+                    if missing_position.size else 0.0
+                ),
+                'missing_position_jump_max': (
+                    float(np.max(missing_position))
+                    if missing_position.size else 0.0
+                ),
+                'missing_velocity_jump_mean': (
+                    float(np.mean(missing_velocity))
+                    if missing_velocity.size else 0.0
+                ),
+                'missing_velocity_jump_max': (
+                    float(np.max(missing_velocity))
+                    if missing_velocity.size else 0.0
+                ),
+            }
+            records.append(record)
     return records
 
 
@@ -142,7 +192,10 @@ def complete_f64_with_model(
 ):
     """按四个非重叠 F16 窗口补全，并精确恢复全部可见关节。"""
     masked = np.asarray(masked_keypoint, dtype=np.float32)
-    missing = np.asarray(missing_mask, dtype=bool)
+    raw_missing = np.asarray(missing_mask)
+    if raw_missing.dtype != np.bool_:
+        raise ValueError('missing_mask dtype must be bool')
+    missing = np.asarray(raw_missing, dtype=bool)
     if masked.ndim != 4 or masked.shape[1:] != (64, 17, 3):
         raise ValueError('masked_keypoint must be (samples,64,17,3)')
     if missing.shape != masked.shape[:-1]:
@@ -248,7 +301,7 @@ def complete_f64_with_model(
         'mask_policy': mask_policy,
         'coordinate_transform_mode': coordinate_transform_mode,
         'sample_transforms': sample_transforms,
-        'boundary_diagnostics': _boundary_diagnostics(completed),
+        'boundary_diagnostics': _boundary_diagnostics(completed, missing),
         'missing_mask_semantics': 'True=missing',
         'demonstration_source_splits': sorted(demonstration_splits),
         'observed_restoration_max_abs_error': observed_error,

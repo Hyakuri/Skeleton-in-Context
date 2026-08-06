@@ -103,6 +103,7 @@ def _interpolate_root_trajectory(keypoint, missing_mask):
 
 def _visible_bone_scale(keypoint, missing_mask, field_name):
     values = []
+    visible_edge_count = 0
     for parent, child in SIC_EDGES:
         visible = ~(missing_mask[:, parent] | missing_mask[:, child])
         if not np.any(visible):
@@ -110,7 +111,16 @@ def _visible_bone_scale(keypoint, missing_mask, field_name):
         lengths = np.linalg.norm(
             keypoint[visible, child] - keypoint[visible, parent], axis=-1
         )
-        values.extend(lengths[lengths > 1e-8].tolist())
+        valid_lengths = lengths[lengths > 1e-8]
+        if valid_lengths.size:
+            visible_edge_count += 1
+            values.extend(valid_lengths.tolist())
+    if visible_edge_count < 3:
+        raise ValueError(
+            '{} has insufficient visible bone topology: {} edges'.format(
+                field_name, visible_edge_count
+            )
+        )
     if len(values) < 16:
         raise ValueError(
             '{} has insufficient visible bone support: {}'.format(
@@ -120,7 +130,7 @@ def _visible_bone_scale(keypoint, missing_mask, field_name):
     scale = float(np.median(np.asarray(values, dtype=np.float64)))
     if not np.isfinite(scale) or scale <= 1e-8:
         raise ValueError('{} visible bone scale is invalid'.format(field_name))
-    return scale, len(values)
+    return scale, len(values), visible_edge_count
 
 
 def prepare_project_h36m17_sample(masked_keypoint, missing_mask, prompt_input):
@@ -144,11 +154,13 @@ def prepare_project_h36m17_sample(masked_keypoint, missing_mask, prompt_input):
     )
     prompt_f64 = np.tile(prompt, (4, 1, 1))
     prompt_root = np.asarray(prompt_f64[:, 0], dtype=np.float32)
-    sample_scale, sample_value_count = _visible_bone_scale(
+    sample_scale, sample_value_count, sample_edge_count = _visible_bone_scale(
         sic_masked, sic_missing, 'sample'
     )
-    reference_scale, reference_value_count = _visible_bone_scale(
-        prompt_f64, sic_missing, 'demonstration'
+    reference_scale, reference_value_count, reference_edge_count = (
+        _visible_bone_scale(
+            prompt_f64, sic_missing, 'demonstration'
+        )
     )
     scale_ratio = float(reference_scale / sample_scale)
 
@@ -177,6 +189,8 @@ def prepare_project_h36m17_sample(masked_keypoint, missing_mask, prompt_input):
         'scale_ratio': scale_ratio,
         'sample_visible_bone_value_count': int(sample_value_count),
         'reference_visible_bone_value_count': int(reference_value_count),
+        'sample_visible_bone_edge_count': int(sample_edge_count),
+        'reference_visible_bone_edge_count': int(reference_edge_count),
         'missing_reset_to_zero': bool(np.all(canonical[sic_missing] == 0.0)),
     }
     return canonical, sic_missing, state, metadata

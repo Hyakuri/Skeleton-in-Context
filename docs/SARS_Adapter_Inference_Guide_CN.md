@@ -41,6 +41,8 @@
 - `demonstration_selection_policy`：正式比较使用 `per_sample_fixed`，四个窗口共享一个 train demonstration。
 - `coordinate_transform_mode`：正式 SARS-Inter 比较使用 `project_h36m17_prompt_aligned_v1`；`identity_h36m17` 只用于复现历史结果。
 
+这两个参数被有意绑定：正式坐标模式必须使用 `per_sample_fixed`，旧版 `identity_h36m17` 必须使用 `per_window`。组合不匹配时程序会明确报错，不会静默改变历史行为。
+
 在 SiC 仓库根目录执行：
 
 ```powershell
@@ -51,13 +53,15 @@
 
 `project_h36m17_prompt_aligned_v1` 对自获数据和 NW-UCLA 使用完全相同的确定性策略：
 
+Query 的坐标契约必须显式声明 `joint_order=h36m17_sars_inter_project_order` 与 `axis_order=[x_lateral,y_depth,z_height]`。这样可以防止已经采用标准 H36M17 顺序的数据再次发生左右肢体置换。
+
 1. 把项目的左腿/右腿和右臂/左臂分组置换到 SiC/MotionBERT H36M17 顺序。
 2. 使用 `(x, y_depth, z_height) -> (x, z_height, -y_depth)` 把项目 Z-up 坐标旋转到 SiC Y-up 空间。
 3. 只根据 query 可见坐标估计一条 F64 root 轨迹和一个可见骨段尺度。
 4. 将 query 对齐到选定的 train demonstration，运行四个 F16 窗口，再对输出执行逆变换。
 5. 精确恢复项目空间中的全部可见坐标。
 
-结果会记录关节置换、轴矩阵、root hash、sample/reference scale、prompt identity/hash、窗口边界诊断、仓库身份和 checkpoint SHA256。
+结果会记录关节置换、轴矩阵、root hash、sample/reference scale、prompt identity/hash、prompt 池 manifest hash/count、source config hash、缺失关节窗口边界诊断、仓库身份和 checkpoint SHA256。Prompt 选择只使用 `masked_keypoint + missing_mask` 的稳定哈希，不解析 sample ID、标签或数据集名称。
 
 ## 自获数据与 NW-UCLA 运行方式
 

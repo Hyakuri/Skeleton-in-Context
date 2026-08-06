@@ -25,6 +25,8 @@ from sars_adapter.inference import (
 from sars_adapter.run_completion import (
     EXTERNAL_PICKLE_PROTOCOL,
     _repository_identity,
+    _resolve_demonstration_selection_policy,
+    _validate_formal_coordinate_contract,
     build_direct_run_config,
     build_result_package,
 )
@@ -202,6 +204,39 @@ class _PromptTargetModel(torch.nn.Module):
 
 
 class InferenceAdapterTest(unittest.TestCase):
+    def test_formal_contract_requires_explicit_project_joint_order(self):
+        contract = {
+            'skeleton': 'H36M17',
+            'axis_order': ['x_lateral', 'y_depth', 'z_height'],
+            'unit': 'dataset_normalized',
+        }
+        with self.assertRaisesRegex(ValueError, 'joint_order'):
+            _validate_formal_coordinate_contract(contract)
+        contract['joint_order'] = 'h36m17_sars_inter_project_order'
+        _validate_formal_coordinate_contract(contract)
+
+    def test_prompt_policy_is_strictly_bound_to_transform_mode(self):
+        self.assertEqual(
+            _resolve_demonstration_selection_policy(
+                'identity_h36m17', None
+            ),
+            'per_window',
+        )
+        self.assertEqual(
+            _resolve_demonstration_selection_policy(
+                'project_h36m17_prompt_aligned_v1', None
+            ),
+            'per_sample_fixed',
+        )
+        with self.assertRaisesRegex(ValueError, 'requires per_window'):
+            _resolve_demonstration_selection_policy(
+                'identity_h36m17', 'per_sample_fixed'
+            )
+        with self.assertRaisesRegex(ValueError, 'requires per_sample_fixed'):
+            _resolve_demonstration_selection_policy(
+                'project_h36m17_prompt_aligned_v1', 'per_window'
+            )
+
     def test_repository_identity_supports_isolated_worktree(self):
         commit, dirty, worktree_hash = _repository_identity()
         self.assertEqual(len(commit), 40)
@@ -276,6 +311,12 @@ class InferenceAdapterTest(unittest.TestCase):
         self.assertEqual(first[2]['source_split'], 'train')
         self.assertEqual(first[2]['identity'], second[2]['identity'])
         self.assertEqual(first[0].shape, (16, 17, 3))
+        self.assertEqual(first[2]['prompt_pool_file_count'], 2)
+        self.assertEqual(
+            len(first[2]['prompt_pool_manifest_sha256']), 64
+        )
+        self.assertEqual(len(first[2]['source_config_sha256']), 64)
+        self.assertEqual(len(first[2]['selection_key_sha256']), 64)
 
     def test_prompt_provider_can_reuse_one_train_demo_for_all_windows(self):
         with tempfile.TemporaryDirectory() as root:
@@ -310,6 +351,63 @@ class InferenceAdapterTest(unittest.TestCase):
             ]
 
         self.assertEqual(len(set(identities)), 1)
+
+    def test_prompt_selection_key_is_invariant_to_query_order(self):
+        with tempfile.TemporaryDirectory() as root:
+            train_dir = os.path.join(root, '3DPW_MC', 'train')
+            os.makedirs(train_dir)
+            for index in range(5):
+                payload = {
+                    'data_input': np.full(
+                        (16, 18, 3), float(index + 1), dtype=np.float32
+                    ),
+                    'data_label': np.full(
+                        (16, 18, 3), float(index + 2), dtype=np.float32
+                    ),
+                }
+                with open(os.path.join(train_dir, '{}.pkl'.format(index)), 'wb') as stream:
+                    pickle.dump(payload, stream)
+            common = {
+                'data_root': root,
+                'source_config': os.path.join(
+                    os.path.dirname(os.path.dirname(__file__)),
+                    'configs',
+                    'default.yaml',
+                ),
+                'seed': 42,
+                'selection_policy': 'per_sample_fixed',
+            }
+            first = build_train_prompt_provider(
+                selection_keys=['input-a', 'input-b'], **common
+            )
+            second = build_train_prompt_provider(
+                selection_keys=['input-b', 'input-a'], **common
+            )
+            mask = np.zeros((16, 17), dtype=bool)
+            first_identity = first(0, 0, mask)[2]['identity']
+            second_identity = second(1, 0, mask)[2]['identity']
+
+        self.assertEqual(first_identity, second_identity)
+
+    def test_direct_inference_rejects_non_boolean_mask(self):
+        masked = np.ones((1, 64, 17, 3), dtype=np.float32)
+        missing = np.zeros((1, 64, 17), dtype=np.uint8)
+
+        def prompt_provider(sample_index, window_index, window_mask):
+            demo = np.ones((16, 17, 3), dtype=np.float32)
+            return demo, demo, {
+                'source_split': 'train',
+                'identity': 'demo',
+            }
+
+        with self.assertRaisesRegex(ValueError, 'dtype must be bool'):
+            complete_f64_with_model(
+                model=_FakeDynamicModel(),
+                masked_keypoint=masked,
+                missing_mask=missing,
+                prompt_provider=prompt_provider,
+                device='cpu',
+            )
 
     def test_formal_coordinate_mode_uses_one_prompt_and_shared_transform(self):
         masked = np.zeros((1, 64, 17, 3), dtype=np.float32)
@@ -361,6 +459,9 @@ class InferenceAdapterTest(unittest.TestCase):
             {'fixed-demo'},
         )
         self.assertEqual(len(metadata['boundary_diagnostics']), 3)
+        self.assertGreater(
+            metadata['boundary_diagnostics'][0]['missing_joint_count'], 0
+        )
 
     def test_result_package_binds_query_and_records_runtime_policy(self):
         query = _query()

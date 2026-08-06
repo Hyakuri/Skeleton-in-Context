@@ -126,6 +126,15 @@ class SampleAlignmentTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'root anchor'):
             prepare_project_h36m17_sample(masked, missing, prompt)
 
+    def test_scale_requires_multiple_visible_bone_edges(self):
+        prompt, _, masked, missing = self._sample()
+        missing[:] = True
+        missing[:, [0, 1]] = False
+        masked[missing] = 0.0
+
+        with self.assertRaisesRegex(ValueError, 'bone topology'):
+            prepare_project_h36m17_sample(masked, missing, prompt)
+
 
 if __name__ == '__main__':
     unittest.main()

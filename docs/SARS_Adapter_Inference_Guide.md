@@ -41,6 +41,8 @@ Edit `build_direct_run_config()` in `sars_adapter/run_completion.py`:
 - `demonstration_selection_policy`: use `per_sample_fixed` for formal comparison; all four windows share one train demonstration.
 - `coordinate_transform_mode`: use `project_h36m17_prompt_aligned_v1` for formal SARS-Inter comparison. `identity_h36m17` remains available only for historical reproduction.
 
+The two options are intentionally coupled. Formal coordinate mode requires `per_sample_fixed`; legacy identity mode requires `per_window`. A mismatched pair is rejected instead of silently changing historical behavior.
+
 Run from the SiC repository root:
 
 ```powershell
@@ -51,13 +53,15 @@ Run from the SiC repository root:
 
 `project_h36m17_prompt_aligned_v1` applies the same deterministic policy to the custom dataset and NW-UCLA:
 
+The query coordinate contract must explicitly declare `joint_order=h36m17_sars_inter_project_order` and `axis_order=[x_lateral,y_depth,z_height]`. This prevents a standard-order H36M17 package from being permuted a second time.
+
 1. Swap the project left-leg/right-leg and right-arm/left-arm groups into the SiC/MotionBERT H36M17 order.
 2. Rotate project Z-up coordinates with `(x, y_depth, z_height) -> (x, z_height, -y_depth)`.
 3. Estimate one F64 root trajectory and one visible-bone scale using only observed query coordinates.
 4. Align the query to the selected train demonstration, run four F16 windows, and inverse-transform the output.
 5. Restore every observed project-space coordinate exactly.
 
-The result records the permutation, axis matrix, root hashes, sample/reference scales, prompt identity/hash, boundary diagnostics, repository identity, and checkpoint SHA256.
+The result records the permutation, axis matrix, root hashes, sample/reference scales, prompt identity/hash, prompt-pool manifest hash/count, source-config hash, missing-joint boundary diagnostics, repository identity, and checkpoint SHA256. Prompt selection uses a stable hash of `masked_keypoint + missing_mask`; it never parses sample IDs, labels, or dataset names.
 
 ## Custom And NW-UCLA Runs
 

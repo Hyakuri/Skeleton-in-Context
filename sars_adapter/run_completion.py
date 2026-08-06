@@ -101,6 +101,49 @@ def _git_command(*arguments):
     return ['git', '-c', 'safe.directory={}'.format(safe_root)] + list(arguments)
 
 
+def _validate_formal_coordinate_contract(contract):
+    value = dict(contract or {})
+    if value.get('skeleton') != 'H36M17':
+        raise ValueError('formal coordinate adapter requires H36M17 query')
+    if value.get('joint_order') != 'h36m17_sars_inter_project_order':
+        raise ValueError(
+            'formal coordinate adapter requires joint_order='
+            'h36m17_sars_inter_project_order'
+        )
+    if value.get('axis_order') != [
+        'x_lateral', 'y_depth', 'z_height'
+    ]:
+        raise ValueError(
+            'formal coordinate adapter requires project Z-up axis_order'
+        )
+
+
+def _resolve_demonstration_selection_policy(transform_mode, configured):
+    expected = (
+        'per_sample_fixed' if transform_mode == TRANSFORM_MODE else 'per_window'
+    )
+    policy = str(configured or expected)
+    if policy != expected:
+        raise ValueError(
+            '{} requires {} demonstration selection policy'.format(
+                transform_mode, expected
+            )
+        )
+    return policy
+
+
+def _sample_input_selection_keys(query):
+    masked = np.asarray(query['masked_keypoint'], dtype=np.float32)
+    missing = np.asarray(query['missing_mask'], dtype=bool)
+    keys = []
+    for index in range(masked.shape[0]):
+        digest = hashlib.sha256()
+        digest.update(np.ascontiguousarray(masked[index]).tobytes(order='C'))
+        digest.update(np.ascontiguousarray(missing[index]).tobytes(order='C'))
+        keys.append(digest.hexdigest())
+    return keys
+
+
 def build_result_package(
     query,
     completed_keypoint,
@@ -216,15 +259,10 @@ def run_completion(config):
     if transform_mode not in {'identity_h36m17', TRANSFORM_MODE}:
         raise ValueError('unsupported coordinate_transform_mode')
     if transform_mode == TRANSFORM_MODE:
-        contract = query.get('coordinate_contract') or {}
-        if contract.get('skeleton') != 'H36M17':
-            raise ValueError('formal coordinate adapter requires H36M17 query')
-        if contract.get('axis_order') != [
-            'x_lateral', 'y_depth', 'z_height'
-        ]:
-            raise ValueError(
-                'formal coordinate adapter requires project Z-up axis_order'
-            )
+        _validate_formal_coordinate_contract(query.get('coordinate_contract'))
+    selection_policy = _resolve_demonstration_selection_policy(
+        transform_mode, resolved.get('demonstration_selection_policy')
+    )
     preview = {
         'status': 'planned' if resolved.get('dry_run', True) else 'running',
         'query_hash': query['query_hash'],
@@ -241,9 +279,8 @@ def run_completion(config):
     prompt_provider = build_train_prompt_provider(
         resolved['data_root'], resolved['source_config'],
         seed=int(resolved.get('demonstration_seed', 42)),
-        selection_policy=resolved.get(
-            'demonstration_selection_policy', 'per_sample_fixed'
-        ),
+        selection_policy=selection_policy,
+        selection_keys=_sample_input_selection_keys(query),
     )
     started = time.perf_counter()
     completed, inference_metadata = complete_f64_with_model(
@@ -272,9 +309,7 @@ def run_completion(config):
         'inference_task': 'joint_completion',
         'demonstration_source_splits': ['train'],
         'demonstration_seed': int(resolved.get('demonstration_seed', 42)),
-        'demonstration_selection_policy': resolved.get(
-            'demonstration_selection_policy', 'per_sample_fixed'
-        ),
+        'demonstration_selection_policy': selection_policy,
         'window_policy': inference_metadata['window_policy'],
         'window_records': inference_metadata['windows'],
         'mask_policy': inference_metadata['mask_policy'],
