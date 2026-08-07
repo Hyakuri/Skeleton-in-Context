@@ -25,15 +25,35 @@ The adapter reports position and velocity discontinuities at frames 16, 32, and 
 
 Temporal interruption results must be reported as an out-of-distribution SiC application unless a matching SiC training protocol is added.
 
+## Checkpoint Source Modes
+
+Two explicit modes share the same downstream inference path:
+
+- `direct_path` is for smoke and diagnostic runs. Fill `checkpoint_path` and the matching `source_config`; the runner computes the checkpoint SHA256 automatically. A dry-run reports the computed hash without loading the model.
+- `identity_manifest` is the formal default. It accepts only a portable `checkpoint_identity.json` with `checkpoint_identity_policy=require_mc_only`. The manifest binds an MC-only checkpoint, its exact `effective_config.yaml`, sizes, SHA256 values, training identity, and its own canonical hash.
+
+Create the formal bundle by editing `build_direct_run_config()` in `sars_adapter/freeze_checkpoint.py`. First use `dry_run=True` to inspect the identities, then set `dry_run=False` to publish the bundle. A bundle has this portable layout:
+
+```text
+<bundle>/
+  checkpoint_identity.json
+  <selected-checkpoint>.bin
+  effective_config.yaml
+```
+
+The manifest stores relative filenames only. Copy the whole directory to another computer and configure only the new `checkpoint_identity_manifest_path`; do not manually copy the old absolute paths or retype the SHA256. An existing different bundle is never replaced in place, even if an old config still contains `overwrite=True`; create a new output directory instead.
+
 ## Direct Configuration
 
 Edit `build_direct_run_config()` in `sars_adapter/run_completion.py`:
 
 - `dry_run`: validate paths/query only or run inference.
 - `query_path`: V2 `completion_query.pkl`; never point this to the private sidecar.
-- `checkpoint_path`: frozen SiC checkpoint.
-- `source_config`: the run-specific `effective_config.yaml` matching the checkpoint; MC-only training must preserve `tasks: [MC]`.
-- `checkpoint_identity_policy`: use `require_mc_only` for formal experiments. It rejects legacy checkpoints, multi-task checkpoints, and a `source_config` whose SHA256 differs from the checkpoint training identity. `allow_legacy` exists only to reproduce old smoke checkpoints and must not be used for paper results.
+- `checkpoint_source_mode`: `identity_manifest` for formal runs or `direct_path` for smoke runs.
+- `checkpoint_identity_manifest_path`: required only by formal mode; points to the copied bundle's `checkpoint_identity.json`.
+- `checkpoint_path`: required only by `direct_path`; its SHA256 is calculated automatically.
+- `source_config`: required only by `direct_path`; it must be the run-specific `effective_config.yaml` matching the checkpoint.
+- `checkpoint_identity_policy`: formal manifest mode is fixed to `require_mc_only`. `allow_legacy` is accepted only with `direct_path` for old smoke checkpoints and must not be used for paper results.
 - `data_root`: official data root containing `3DPW_MC/train`.
 - `output_path`: V2 `completion_result.pkl` returned to SARS-Inter.
 - `device`: `cuda:0` or `cpu`.

@@ -25,15 +25,35 @@
 
 除非追加匹配的 SiC 训练协议，否则 temporal interruption 结果必须表述为 SiC 的分布外应用。
 
+## Checkpoint 来源模式
+
+两种模式共用完全相同的后续补全逻辑：
+
+- `direct_path` 用于冒烟和诊断。填写 `checkpoint_path` 与匹配的 `source_config` 后，程序会自动计算 checkpoint SHA256；dry-run 会报告该哈希，但不会加载模型。
+- `identity_manifest` 是正式实验默认模式。它只接受 `checkpoint_identity_policy=require_mc_only` 的可移植 `checkpoint_identity.json`，并绑定 MC-only checkpoint、对应的 `effective_config.yaml`、文件大小、SHA256、训练身份和 manifest 自身哈希。
+
+正式冻结时，在 `sars_adapter/freeze_checkpoint.py` 的 `build_direct_run_config()` 中填写参数。先使用 `dry_run=True` 检查身份，再改为 `dry_run=False` 发布 bundle：
+
+```text
+<bundle>/
+  checkpoint_identity.json
+  <selected-checkpoint>.bin
+  effective_config.yaml
+```
+
+manifest 只保存相对文件名。跨电脑时整体复制该目录，只需填写新电脑上的 `checkpoint_identity_manifest_path`，不需要复制旧绝对路径，也不需要手工重新输入 SHA256。已有不同 bundle 即使旧配置仍写有 `overwrite=True` 也不会被原地替换；应使用新的输出目录。
+
 ## 直接执行参数
 
 在 `sars_adapter/run_completion.py` 的 `build_direct_run_config()` 中调整：
 
 - `dry_run`：只检查路径/query，或执行真实推理。
 - `query_path`：V2 `completion_query.pkl`，不得指向私有 sidecar。
-- `checkpoint_path`：冻结的 SiC checkpoint。
-- `source_config`：与 checkpoint 同 run 的 `effective_config.yaml`；MC-only 训练时必须保留 `tasks: [MC]`。
-- `checkpoint_identity_policy`：正式实验必须使用 `require_mc_only`。它会拒绝旧 checkpoint、多任务 checkpoint，以及 SHA256 与 checkpoint 训练身份不一致的 `source_config`。`allow_legacy` 只用于复现旧冒烟权重，不得用于论文正式结果。
+- `checkpoint_source_mode`：正式运行填写 `identity_manifest`，冒烟运行填写 `direct_path`。
+- `checkpoint_identity_manifest_path`：仅正式模式填写，指向复制后 bundle 内的 `checkpoint_identity.json`。
+- `checkpoint_path`：仅 `direct_path` 填写，SHA256 由程序自动计算。
+- `source_config`：仅 `direct_path` 填写，必须是 checkpoint 同一次训练保存的 `effective_config.yaml`。
+- `checkpoint_identity_policy`：正式 manifest 模式固定为 `require_mc_only`；`allow_legacy` 只允许配合 `direct_path` 复现旧冒烟权重，不得用于论文正式结果。
 - `data_root`：包含 `3DPW_MC/train` 的官方数据根目录。
 - `output_path`：返回 SARS-Inter 的 V2 `completion_result.pkl`。
 - `device`：`cuda:0` 或 `cpu`。

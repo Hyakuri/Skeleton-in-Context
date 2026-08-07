@@ -25,8 +25,8 @@ SARS-Inter masked dataset
 
 - SiC adapter fork URL、40 位 commit 和 clean-worktree 状态。
 - 官方 upstream URL 与 40 位 commit。
-- SiC checkpoint SHA256。
-- 官方 source YAML SHA256。
+- 可移植 SiC checkpoint identity bundle 及其 manifest hash。
+- 由 manifest 记录的 SiC checkpoint 与本次训练 `effective_config.yaml` SHA256。
 - `3DPW_MC/train` prompt pool 的文件数量和 manifest SHA256。
 - demonstration seed、选择策略、mask policy 和坐标转换模式。
 
@@ -64,12 +64,14 @@ external_completion_export/
 | --- | --- |
 | `plan_path` | SARS-Inter 生成的 `external_completion_run_plan.json`。 |
 | `output_root` | 结果根目录；每个 job 按 plan 的 `result_relative_path` 保存。 |
-| `checkpoint_path` | 冻结 SiC checkpoint 的完整路径。 |
-| `source_config` | 与 checkpoint 同 run 的 `effective_config.yaml`；正式 MC-only checkpoint 不应改回仓库默认 YAML。 |
-| `checkpoint_identity_policy` | 正式运行填写 `require_mc_only`；`allow_legacy` 只兼容旧冒烟 checkpoint，不得用于论文结果。 |
+| `checkpoint_source_mode` | 正式跨设备运行填写 `identity_manifest`；`direct_path` 只用于冒烟诊断。 |
+| `checkpoint_identity_manifest_path` | 正式 bundle 内的 `checkpoint_identity.json`；程序会解析相对 checkpoint/config 文件名并验证全部哈希。 |
+| `checkpoint_path` | 仅 `direct_path` 使用，SHA256 由程序自动计算。 |
+| `source_config` | 仅 `direct_path` 使用，必须与所选 checkpoint 来自同一次训练。 |
+| `checkpoint_identity_policy` | 正式 manifest 模式固定为 `require_mc_only`；`allow_legacy` 只允许 direct-path 旧冒烟 checkpoint。 |
 | `data_root` | SiC 数据根目录，必须包含 train-only demonstration pool。 |
 | `device` | 通常为 `cuda:0`；CPU 仅适合接口测试。 |
-| `dry_run` | `True` 只校验 plan 且不加载模型；`False` 运行真实 GPU 推理。 |
+| `dry_run` | `True` 校验 plan 与 checkpoint 身份且不加载模型；`False` 运行真实 GPU 推理。 |
 | `require_clean_repository` | 正式默认 `True`，拒绝未提交修改。 |
 | `resume` | `True` 时仅复用通过全部 hash、shape、finite 和 provenance 校验的已有结果。 |
 | `strict` | `True` 时 job 失败后先保存 summary，再抛出异常。 |
