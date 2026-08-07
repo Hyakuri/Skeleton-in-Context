@@ -14,6 +14,7 @@ import numpy as np
 from sars_adapter.contracts import load_completion_query
 from sars_adapter.run_completion import (
     _package_hash,
+    _resolve_runtime_paths,
     prepare_completion_runtime,
     run_completion,
     verify_completion_runtime_assets,
@@ -24,14 +25,16 @@ from sars_adapter.series_contracts import load_run_plan
 def build_direct_run_config():
     """集中配置 public plan 批量执行入口。"""
     return {
+        'checkpoint_source_mode': 'identity_manifest',  # 正式使用身份清单；smoke 可改为 direct_path。
+        'checkpoint_identity_manifest_path': '<SIC_CHECKPOINT_IDENTITY_JSON>',  # 正式 bundle 中的身份清单。
         'plan_path': '<PUBLIC_RUN_PLAN_JSON>',  # 仅含公开 query job 的 V1 plan。
         'output_root': '<COMPLETION_RESULT_ROOT>',  # 所有相对结果路径的安全根目录。
-        'checkpoint_path': '<SIC_CHECKPOINT_PATH>',  # 冻结的 SiC checkpoint。
-        'source_config': '<SIC_EFFECTIVE_CONFIG_PATH>',  # 必须填写与 checkpoint 同 run 的 effective_config.yaml，避免任务范围记录错误。
-        'checkpoint_identity_policy': 'require_mc_only',  # require_mc_only=正式实验仅接受同配置的 MC-only checkpoint；allow_legacy=仅兼容旧冒烟权重。
+        'checkpoint_path': '<SIC_CHECKPOINT_PATH>',  # 仅 direct_path 冒烟模式填写；程序自动计算 SHA256。
+        'source_config': '<SIC_EFFECTIVE_CONFIG_PATH>',  # 仅 direct_path 填写，且必须与 checkpoint 来自同一次训练。
+        'checkpoint_identity_policy': 'require_mc_only',  # identity_manifest 固定 require_mc_only；allow_legacy 只允许 direct_path 旧权重冒烟。
         'data_root': '<SIC_DATA_ROOT>',  # 只读取 3DPW_MC/train demonstrations。
         'device': 'cuda:0',  # 可填写 cuda:0 或 cpu。
-        'dry_run': True,  # True=只校验 plan 并记录 planned，不加载模型。
+        'dry_run': True,  # True=校验 plan 与 checkpoint 身份并记录 planned，不加载模型。
         'require_clean_repository': True,  # True=真实批处理拒绝 dirty worktree。
         'resume': True,  # True=仅跳过通过完整绑定校验的已有结果。
         'strict': True,  # True=失败且未启用 continue_on_error 时抛错。
@@ -241,6 +244,14 @@ def run_completion_series(config, completion_runner=run_completion):
     total = len(plan['jobs'])
 
     if bool(resolved.get('dry_run', True)):
+        checkpoint_source = _resolve_runtime_paths(resolved)
+        expected_checkpoint = str(
+            plan['method_profile'].get('checkpoint_sha256') or ''
+        ).strip().lower()
+        if expected_checkpoint != checkpoint_source['checkpoint_sha256']:
+            raise ValueError(
+                'run-plan checkpoint mismatch during dry-run preflight'
+            )
         for index, job in enumerate(plan['jobs'], 1):
             _verify_plan_unchanged(plan_path, original_plan_hash)
             output_path = os.path.join(
@@ -251,6 +262,17 @@ def run_completion_series(config, completion_runner=run_completion):
                 'status': 'planned',
                 'query_hash': job['query_hash'],
                 'output_path': output_path,
+                'checkpoint_source_mode': checkpoint_source[
+                    'checkpoint_source_mode'
+                ],
+                'checkpoint_sha256': checkpoint_source[
+                    'checkpoint_sha256'
+                ],
+                'checkpoint_identity_manifest_sha256': (
+                    checkpoint_source.get(
+                        'checkpoint_identity_manifest_sha256'
+                    )
+                ),
                 'error': None,
             }
             records.append(record)

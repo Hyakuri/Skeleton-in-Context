@@ -16,6 +16,11 @@ import torch
 
 from lib.utils.learning import load_backbone
 from lib.utils.tools import get_config
+from sars_adapter.checkpoint_identity import (
+    resolve_checkpoint_source,
+    sha256_file as _identity_sha256_file,
+    validate_completion_checkpoint_identity,
+)
 from sars_adapter.contracts import load_completion_query
 from sars_adapter.coordinate_adapter import TRANSFORM_MODE
 from sars_adapter.inference import (
@@ -37,12 +42,14 @@ ADAPTER_FORK_REPOSITORY_URL = 'https://github.com/Hyakuri/Skeleton-in-Context'
 def build_direct_run_config():
     """集中放置外部补全推理需要手动调整的参数。"""
     return {
+        'checkpoint_source_mode': 'identity_manifest',  # 正式使用身份清单；smoke 可改为 direct_path。
+        'checkpoint_identity_manifest_path': '<SIC_CHECKPOINT_IDENTITY_JSON>',  # 正式 bundle 中的身份清单。
         'dry_run': True,  # True=仅检查输入；False=执行真实 GPU 推理。
         'require_clean_repository': True,  # True=正式补值只允许无未提交改动的仓库。
         'query_path': '<COMPLETION_QUERY_PATH>',  # SARS-Inter V2 query，不得传评价 sidecar。
-        'checkpoint_path': '<SIC_CHECKPOINT_PATH>',  # SiC latest/best checkpoint。
-        'source_config': '<SIC_EFFECTIVE_CONFIG_PATH>',  # 必须填写与 checkpoint 同 run 的 effective_config.yaml，避免任务范围记录错误。
-        'checkpoint_identity_policy': 'require_mc_only',  # require_mc_only=正式实验仅接受同配置的 MC-only checkpoint；allow_legacy=仅兼容旧冒烟权重。
+        'checkpoint_path': '<SIC_CHECKPOINT_PATH>',  # 仅 direct_path 冒烟模式填写；程序自动计算 SHA256。
+        'source_config': '<SIC_EFFECTIVE_CONFIG_PATH>',  # 仅 direct_path 填写，且必须与 checkpoint 来自同一次训练。
+        'checkpoint_identity_policy': 'require_mc_only',  # identity_manifest 固定 require_mc_only；allow_legacy 只允许 direct_path 旧权重冒烟。
         'data_root': '<SIC_DATA_ROOT>',  # 包含 3DPW_MC/train 的官方数据根目录。
         'output_path': '<COMPLETION_RESULT_PATH>',  # 返回 SARS-Inter 的 V2 result pkl。
         'device': 'cuda:0',  # 可选 cuda:0 或 cpu。
@@ -90,49 +97,7 @@ def _package_hash(package, field_name):
 
 
 def _sha256_file(path):
-    digest = hashlib.sha256()
-    with open(path, 'rb') as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def validate_completion_checkpoint_identity(
-    checkpoint, source_config, policy='require_mc_only'
-):
-    """校验补值 checkpoint 与训练配置、任务范围是否一致。"""
-    policy = str(policy or 'require_mc_only')
-    if policy not in {'require_mc_only', 'allow_legacy'}:
-        raise ValueError('unsupported checkpoint identity policy')
-
-    identity = checkpoint.get('training_identity')
-    if identity is None:
-        if policy == 'require_mc_only':
-            raise ValueError(
-                'formal completion checkpoint is missing training identity'
-            )
-        return None
-    if not isinstance(identity, dict):
-        raise ValueError('checkpoint training identity must be a dict')
-
-    expected_config_hash = str(
-        identity.get('effective_config_sha256') or ''
-    ).lower()
-    actual_config_hash = _sha256_file(source_config).lower()
-    if expected_config_hash != actual_config_hash:
-        raise ValueError(
-            'checkpoint source config hash does not match source_config'
-        )
-
-    if policy == 'require_mc_only':
-        if (
-            list(identity.get('tasks') or []) != ['MC']
-            or identity.get('task_scope') != 'single_task'
-        ):
-            raise ValueError(
-                'formal completion requires an MC-only single-task checkpoint'
-            )
-    return copy.deepcopy(identity)
+    return _identity_sha256_file(path)
 
 
 def _update_length_prefixed(digest, value):
@@ -303,16 +268,13 @@ def _load_model(
     return model
 
 
-def _resolve_runtime_paths(config):
+def _normalize_runtime_options(config):
     resolved = copy.deepcopy(dict(config))
-    for name in ('checkpoint_path', 'source_config', 'data_root'):
+    for name in ('data_root',):
         value = os.path.abspath(os.path.expanduser(str(resolved.get(name) or '')))
         if not value or '<' in value or '>' in value:
             raise ValueError('{} still contains a placeholder'.format(name))
         resolved[name] = value
-    for name in ('checkpoint_path', 'source_config'):
-        if not os.path.isfile(resolved[name]):
-            raise FileNotFoundError(resolved[name])
     if not os.path.isdir(resolved['data_root']):
         raise FileNotFoundError(resolved['data_root'])
     resolved['device'] = str(resolved.get('device') or 'cuda:0')
@@ -335,6 +297,30 @@ def _resolve_runtime_paths(config):
         )
     )
     return resolved
+
+
+def _resolve_runtime_paths(config):
+    return _normalize_runtime_options(resolve_checkpoint_source(config))
+
+
+def _reuse_checkpoint_source(config, cached):
+    resolved = copy.deepcopy(dict(config))
+    mode = resolved.get('checkpoint_source_mode')
+    if mode is not None and str(mode) != cached['checkpoint_source_mode']:
+        raise ValueError('shared completion checkpoint_source_mode mismatch')
+    for name in (
+        'checkpoint_identity_manifest_path', 'checkpoint_path', 'source_config'
+    ):
+        configured = str(resolved.get(name) or '').strip()
+        if not configured or '<' in configured or '>' in configured:
+            continue
+        if os.path.abspath(os.path.expanduser(configured)) != cached.get(name):
+            raise ValueError('shared completion {} mismatch'.format(name))
+    expected_sha256 = str(resolved.get('checkpoint_sha256') or '').strip().lower()
+    if expected_sha256 and expected_sha256 != cached['checkpoint_sha256']:
+        raise ValueError('shared completion checkpoint_sha256 mismatch')
+    resolved.update(copy.deepcopy(cached))
+    return _normalize_runtime_options(resolved)
 
 
 def _completion_policy(resolved):
@@ -361,11 +347,29 @@ def _completion_policy(resolved):
 
 def prepare_completion_runtime(config, runtime=None, load_model=True):
     """准备可跨 query 复用、但不保存 query 私有状态的运行时。"""
-    resolved = _resolve_runtime_paths(config)
     shared = runtime if runtime is not None else {}
+    cached_source = shared.get('resolved_checkpoint_source')
+    if cached_source is None:
+        resolved = _resolve_runtime_paths(config)
+        shared['resolved_checkpoint_source'] = {
+            name: copy.deepcopy(resolved.get(name))
+            for name in (
+                'checkpoint_source_mode',
+                'checkpoint_identity_manifest_path',
+                'checkpoint_identity_manifest_sha256',
+                'checkpoint_path',
+                'source_config',
+                'checkpoint_sha256',
+                'checkpoint_identity_policy',
+                'checkpoint_training_identity',
+            )
+        }
+    else:
+        resolved = _reuse_checkpoint_source(config, cached_source)
     signature = (
         resolved['source_config'], resolved['data_root'],
         resolved['checkpoint_path'], resolved['device'],
+        resolved.get('checkpoint_identity_manifest_sha256'),
         resolved['coordinate_transform_mode'],
         resolved['demonstration_selection_policy'],
         int(resolved.get('demonstration_seed', 42)),
@@ -391,9 +395,7 @@ def prepare_completion_runtime(config, runtime=None, load_model=True):
             'formal SiC completion requires a clean repository worktree'
         )
     if 'checkpoint_sha256' not in shared:
-        shared['checkpoint_sha256'] = _sha256_file(
-            resolved['checkpoint_path']
-        )
+        shared['checkpoint_sha256'] = resolved['checkpoint_sha256']
     if (
         not load_model
         and resolved['checkpoint_identity_policy'] == 'require_mc_only'
@@ -423,6 +425,10 @@ def prepare_completion_runtime(config, runtime=None, load_model=True):
             },
             'checkpoint': {
                 'sha256': shared['checkpoint_sha256'],
+                'source_mode': resolved['checkpoint_source_mode'],
+                'identity_manifest_sha256': resolved.get(
+                    'checkpoint_identity_manifest_sha256'
+                ),
                 'training_identity': copy.deepcopy(
                     shared.get('checkpoint_training_identity')
                 ),
@@ -468,6 +474,16 @@ def verify_completion_runtime_assets(config, runtime):
     """在 series 结束前复核冻结资产，防止长任务期间身份漂移。"""
     resolved = _resolve_runtime_paths(config)
     shared = dict(runtime or {})
+    cached_manifest_hash = (
+        (shared.get('provenance') or {}).get('checkpoint') or {}
+    ).get('identity_manifest_sha256')
+    if (
+        resolved.get('checkpoint_identity_manifest_sha256')
+        != cached_manifest_hash
+    ):
+        raise RuntimeError(
+            'SiC checkpoint identity manifest changed during completion series'
+        )
     if _sha256_file(resolved['checkpoint_path']) != shared.get(
         'checkpoint_sha256'
     ):
@@ -494,12 +510,12 @@ def verify_completion_runtime_assets(config, runtime):
 
 def run_completion(config, runtime=None):
     resolved = copy.deepcopy(dict(config))
-    for name in ('query_path', 'checkpoint_path', 'source_config', 'data_root', 'output_path'):
+    for name in ('query_path', 'data_root', 'output_path'):
         value = os.path.abspath(os.path.expanduser(str(resolved.get(name) or '')))
         if not value or '<' in value or '>' in value:
             raise ValueError('{} still contains a placeholder'.format(name))
         resolved[name] = value
-    for name in ('query_path', 'checkpoint_path', 'source_config'):
+    for name in ('query_path',):
         if not os.path.isfile(resolved[name]):
             raise FileNotFoundError(resolved[name])
     if not os.path.isdir(resolved['data_root']):
@@ -520,6 +536,25 @@ def run_completion(config, runtime=None):
         'output_path': resolved['output_path'],
     }
     if resolved.get('dry_run', True):
+        checkpoint_source = _resolve_runtime_paths(resolved)
+        checkpoint = torch.load(
+            checkpoint_source['checkpoint_path'], map_location='cpu'
+        )
+        training_identity = validate_completion_checkpoint_identity(
+            checkpoint,
+            checkpoint_source['source_config'],
+            policy=checkpoint_source['checkpoint_identity_policy'],
+        )
+        preview.update({
+            'checkpoint_source_mode': checkpoint_source[
+                'checkpoint_source_mode'
+            ],
+            'checkpoint_sha256': checkpoint_source['checkpoint_sha256'],
+            'checkpoint_identity_manifest_sha256': checkpoint_source.get(
+                'checkpoint_identity_manifest_sha256'
+            ),
+            'checkpoint_training_identity': copy.deepcopy(training_identity),
+        })
         return preview
     resolved['demonstration_selection_policy'] = selection_policy
     shared = prepare_completion_runtime(resolved, runtime=runtime, load_model=True)

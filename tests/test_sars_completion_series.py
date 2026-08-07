@@ -167,7 +167,10 @@ class CompletionSeriesTest(unittest.TestCase):
                 'version': 1,
                 'tasks': ['MC'],
                 'task_scope': 'single_task',
+                'subset_seed': 42,
+                'training_seed': 42,
                 'effective_config_sha256': '0' * 64,
+                'subset_manifest_sha256': '1' * 64,
             },
             'model_pos': {},
         }, self.checkpoint_path)

@@ -228,7 +228,10 @@ class TrainingIdentityTest(unittest.TestCase):
                 'version': 1,
                 'tasks': ['MC'],
                 'task_scope': 'single_task',
+                'subset_seed': 42,
+                'training_seed': 42,
                 'effective_config_sha256': train_module._sha256_file(config_path),
+                'subset_manifest_sha256': 'b' * 64,
             }
             validated = validate_completion_checkpoint_identity(
                 {'training_identity': identity},
@@ -266,7 +269,10 @@ class TrainingIdentityTest(unittest.TestCase):
                 'version': 1,
                 'tasks': list(OFFICIAL_TASKS),
                 'task_scope': 'multi_task',
+                'subset_seed': 42,
+                'training_seed': 42,
                 'effective_config_sha256': train_module._sha256_file(config_path),
+                'subset_manifest_sha256': 'b' * 64,
             }
             with self.assertRaisesRegex(ValueError, 'MC-only'):
                 validate_completion_checkpoint_identity(
