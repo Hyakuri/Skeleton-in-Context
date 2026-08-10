@@ -141,13 +141,15 @@ Edit `build_direct_run_config()` in the series runner:
 | `data_root` | SiC data root containing the train-only demonstration pool. |
 | `device` | Inference device, normally `cuda:0`. |
 | `dry_run` | `True` validates the plan and checkpoint identity without loading the model; `False` performs inference. |
-| `resume` | Reuses an existing result only after query, shape, finite-value, checkpoint, prompt-pool, source-config, and completion-policy validation. Git revision metadata does not invalidate a result. |
+| `resume` | Reuses an existing result only after query, shape, finite-value, checkpoint, prompt-pool, source-config, and completion-policy validation. The completion policy includes the semantic-anchor identity, so results from the old root-only adapter are rejected. Git revision metadata does not invalidate a result. |
 | `strict` | Raises after a failed job. A failure summary is still saved first. |
 | `continue_on_error` | Continues later jobs only when `strict=False`; never turns a failed record into success. |
 | `mask_policy` | `strict_official_mc` rejects unsupported masks; `allow_ood_explicit` runs the paper masks and records explicit OOD reasons. |
 | `demonstration_seed` | Deterministic train-demonstration selection seed. |
 | `demonstration_selection_policy` | `per_sample_fixed` uses one train demonstration across the four F16 windows of a sample. |
-| `coordinate_transform_mode` | Formal mode is `project_h36m17_prompt_aligned_v1`; it applies the frozen joint, axis, root, and scale adapter. |
+| `coordinate_transform_mode` | Formal mode remains `project_h36m17_prompt_aligned_v1` as a cross-repository contract identifier. Its single current implementation applies the frozen joint/axis conversion, paired visible semantic anchors, and one F64 visible-bone scale. There is no selectable root-only implementation. |
+
+For every F64 sample, the adapter deterministically selects a paired query/prompt anchor in this order: pelvis or hip midpoint, center torso, upper torso, shoulder midpoint, then a fixed sorted visible-joint centroid. This allows the explicit OOD `bottom` mask to run without fabricating a pelvis observation or using clean/GT data. All four F16 windows share the same anchor trajectory and scale. Completely unobservable or geometrically unsupported samples remain errors.
 
 Run:
 

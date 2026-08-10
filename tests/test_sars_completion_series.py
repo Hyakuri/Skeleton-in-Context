@@ -522,6 +522,47 @@ class CompletionSeriesTest(unittest.TestCase):
         self.assertEqual(load_model.call_count, 1)
         self.assertEqual(rerun['records'][0]['status'], 'completed')
 
+    def test_resume_rejects_result_without_semantic_anchor_identity(self):
+        plan_path, _ = self._write_plan([self._job('old-anchor-policy')])
+        patches = (
+            mock.patch(
+                'sars_adapter.run_completion._load_model', return_value=object()
+            ),
+            mock.patch(
+                'sars_adapter.run_completion.build_train_prompt_provider',
+                side_effect=self._fake_prompt_provider([]),
+            ),
+            mock.patch(
+                'sars_adapter.run_completion.complete_f64_with_model',
+                side_effect=self._fake_completion,
+            ),
+        )
+        with patches[0], patches[1], patches[2]:
+            first = run_completion_series(self._config(plan_path))
+        result_path = first['records'][0]['output_path']
+        with open(result_path, 'rb') as stream:
+            result = pickle.load(stream)
+        result['provenance']['completion_policy'].pop(
+            'coordinate_anchor_policy'
+        )
+        result['result_hash'] = _package_hash(result, 'result_hash')
+        with open(result_path, 'wb') as stream:
+            pickle.dump(result, stream, protocol=4)
+
+        with mock.patch(
+            'sars_adapter.run_completion._load_model', return_value=object()
+        ) as load_model, mock.patch(
+            'sars_adapter.run_completion.build_train_prompt_provider',
+            side_effect=self._fake_prompt_provider([]),
+        ), mock.patch(
+            'sars_adapter.run_completion.complete_f64_with_model',
+            side_effect=self._fake_completion,
+        ):
+            rerun = run_completion_series(self._config(plan_path))
+
+        self.assertEqual(load_model.call_count, 1)
+        self.assertEqual(rerun['records'][0]['status'], 'completed')
+
     def test_continue_on_error_preserves_completed_jobs_and_progress(self):
         plan_path, _ = self._write_plan([
             self._job('success', offset=1.0),

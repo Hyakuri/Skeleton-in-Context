@@ -108,6 +108,19 @@ class SampleAlignmentTest(unittest.TestCase):
         self.assertGreater(metadata['sample_visible_bone_value_count'], 0)
         self.assertEqual(state['scale_ratio'], metadata['scale_ratio'])
         self.assertTrue(np.all(canonical[canonical_mask] == 0.0))
+        self.assertEqual(metadata['anchor_mode'], 'pelvis_or_hip_midpoint')
+        self.assertEqual(metadata['anchor_joint_ids'], [0, 1, 4])
+
+        sic_masked = project_axes_to_sic(project_to_sic_joints(masked))
+        prompt_f64 = np.tile(prompt, (4, 1, 1))
+        expected_canonical = (
+            (sic_masked - sic_masked[:, 0:1]) * 0.5
+            + prompt_f64[:, 0:1]
+        ).astype(np.float32)
+        expected_canonical[canonical_mask] = 0.0
+        np.testing.assert_allclose(
+            canonical, expected_canonical, atol=1e-7, rtol=0.0
+        )
 
         restored = np.empty_like(project)
         for start in range(0, 64, 16):
@@ -118,12 +131,75 @@ class SampleAlignmentTest(unittest.TestCase):
 
         np.testing.assert_allclose(restored, project, atol=1e-6, rtol=0.0)
 
-    def test_missing_root_anchor_is_rejected(self):
-        prompt, _, masked, missing = self._sample()
-        missing[:, [0, 1, 4]] = True
+    def test_bottom_mask_uses_upper_torso_anchor_and_roundtrips(self):
+        prompt, project, _, _ = self._sample()
+        missing = np.zeros((64, 17), dtype=bool)
+        missing[:, :8] = True
+        masked = np.array(project, copy=True)
         masked[missing] = 0.0
 
-        with self.assertRaisesRegex(ValueError, 'root anchor'):
+        canonical, canonical_mask, state, metadata = (
+            prepare_project_h36m17_sample(masked, missing, prompt)
+        )
+
+        self.assertEqual(metadata['anchor_mode'], 'upper_torso')
+        self.assertEqual(metadata['anchor_joint_ids'], [8])
+        self.assertEqual(metadata['observed_anchor_frame_count'], 64)
+        self.assertEqual(len(metadata['query_anchor_sha256']), 64)
+        self.assertEqual(len(metadata['prompt_anchor_sha256']), 64)
+        self.assertTrue(np.all(canonical[canonical_mask] == 0.0))
+        restored = np.empty_like(project)
+        prompt_f64 = np.tile(prompt, (4, 1, 1))
+        for start in range(0, 64, 16):
+            restored[start:start + 16] = inverse_project_h36m17_window(
+                prompt_f64[start:start + 16], state, start, start + 16
+            )
+        np.testing.assert_allclose(restored, project, atol=1e-6, rtol=0.0)
+
+    def test_semantic_anchor_fallback_order_is_deterministic(self):
+        prompt, project, _, _ = self._sample()
+
+        cases = (
+            ([0, 1, 4], 'center_torso', [7]),
+            ([0, 1, 4, 7, 8], 'shoulder_midpoint', [11, 14]),
+        )
+        for missing_ids, expected_mode, expected_joint_ids in cases:
+            missing = np.zeros((64, 17), dtype=bool)
+            missing[:, missing_ids] = True
+            masked = np.array(project, copy=True)
+            masked[missing] = 0.0
+
+            canonical, canonical_mask, _, metadata = (
+                prepare_project_h36m17_sample(masked, missing, prompt)
+            )
+
+            self.assertEqual(metadata['anchor_mode'], expected_mode)
+            self.assertEqual(metadata['anchor_joint_ids'], expected_joint_ids)
+            self.assertTrue(np.all(canonical[canonical_mask] == 0.0))
+
+    def test_fixed_visible_centroid_uses_one_sorted_joint_set(self):
+        prompt, project, _, _ = self._sample()
+        visible_ids = [9, 10, 12, 13, 15, 16]
+        missing = np.ones((64, 17), dtype=bool)
+        missing[:, visible_ids] = False
+        masked = np.array(project, copy=True)
+        masked[missing] = 0.0
+
+        canonical, canonical_mask, _, metadata = (
+            prepare_project_h36m17_sample(masked, missing, prompt)
+        )
+
+        self.assertEqual(metadata['anchor_mode'], 'fixed_visible_centroid')
+        self.assertEqual(metadata['anchor_joint_ids'], visible_ids)
+        self.assertEqual(metadata['interpolated_joint_frame_count'], 0)
+        self.assertTrue(np.all(canonical[canonical_mask] == 0.0))
+
+    def test_fully_missing_sample_has_no_visible_semantic_anchor(self):
+        prompt, project, _, _ = self._sample()
+        missing = np.ones((64, 17), dtype=bool)
+        masked = np.zeros_like(project)
+
+        with self.assertRaisesRegex(ValueError, 'visible.*anchor'):
             prepare_project_h36m17_sample(masked, missing, prompt)
 
     def test_scale_requires_multiple_visible_bone_edges(self):

@@ -60,7 +60,7 @@ Edit `build_direct_run_config()` in `sars_adapter/run_completion.py`:
 - `mask_policy`: strict official MC support or explicit OOD research mode.
 - `demonstration_seed`: deterministic train-only demonstration selection.
 - `demonstration_selection_policy`: use `per_sample_fixed` for formal comparison; all four windows share one train demonstration.
-- `coordinate_transform_mode`: use `project_h36m17_prompt_aligned_v1` for formal SARS-Inter comparison. `identity_h36m17` remains available only for historical reproduction.
+- `coordinate_transform_mode`: use `project_h36m17_prompt_aligned_v1` for formal SARS-Inter comparison. This string is retained as the cross-repository contract identifier; the adapter has one current implementation and does not expose an older root-only implementation. `identity_h36m17` remains available only for historical reproduction.
 
 The two options are intentionally coupled. Formal coordinate mode requires `per_sample_fixed`; legacy identity mode requires `per_window`. A mismatched pair is rejected instead of silently changing historical behavior.
 
@@ -78,11 +78,14 @@ The query coordinate contract must explicitly declare `joint_order=h36m17_sars_i
 
 1. Swap the project left-leg/right-leg and right-arm/left-arm groups into the SiC/MotionBERT H36M17 order.
 2. Rotate project Z-up coordinates with `(x, y_depth, z_height) -> (x, z_height, -y_depth)`.
-3. Estimate one F64 root trajectory and one visible-bone scale using only observed query coordinates.
-4. Align the query to the selected train demonstration, run four F16 windows, and inverse-transform the output.
-5. Restore every observed project-space coordinate exactly.
+3. Select one semantic anchor policy for the complete F64 sample, using only observed query coordinates. The deterministic order is pelvis/hip midpoint, center torso, upper torso, shoulder midpoint, then a fixed sorted visible-joint centroid. The train demonstration uses the same semantic joint or joint set.
+4. Interpolate missing anchor frames and extend sequence boundaries from the nearest observed anchor. All four F16 windows share this F64 anchor trajectory and one visible-bone scale.
+5. Align the query to the selected train demonstration, run four F16 windows, and inverse-transform the output.
+6. Restore every observed project-space coordinate exactly.
 
-The result records the permutation, axis matrix, root hashes, sample/reference scales, prompt identity/hash, prompt-pool manifest hash/count, source-config hash, checkpoint training identity, missing-joint boundary diagnostics, repository identity, and checkpoint SHA256. Prompt selection uses a stable hash of `masked_keypoint + missing_mask`; it never parses sample IDs, labels, or dataset names.
+The result records the permutation, axis matrix, semantic anchor mode/joints/hashes, sample/reference scales, prompt identity/hash, prompt-pool manifest hash/count, source-config hash, checkpoint training identity, missing-joint boundary diagnostics, repository identity, and checkpoint SHA256. The stable completion policy includes `coordinate_anchor_policy=paired_visible_semantic_anchor`, so `resume=True` cannot silently reuse a result created by the previous root-only adapter. Prompt selection uses a stable hash of `masked_keypoint + missing_mask`; it never parses sample IDs, labels, or dataset names.
+
+`bottom` masks that hide pelvis and both hips are outside the official SiC MC random-mask distribution. With `mask_policy=allow_ood_explicit`, the adapter uses a matching visible torso or shoulder anchor and records the OOD reason; this enables the comparison without claiming that the mask is in-distribution. A sample with no usable visible semantic anchor or insufficient visible bone support is still rejected.
 
 ## Custom And NW-UCLA Runs
 

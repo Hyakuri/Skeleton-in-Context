@@ -22,7 +22,7 @@ from sars_adapter.checkpoint_identity import (
     validate_completion_checkpoint_identity,
 )
 from sars_adapter.contracts import load_completion_query
-from sars_adapter.coordinate_adapter import TRANSFORM_MODE
+from sars_adapter.coordinate_adapter import ANCHOR_POLICY, TRANSFORM_MODE
 from sars_adapter.inference import (
     build_train_prompt_pool,
     build_train_prompt_provider,
@@ -194,14 +194,17 @@ def _repository_identity():
     """尽力记录仓库状态；Git 元信息不可用时不阻断实验执行。"""
     try:
         commit = subprocess.check_output(
-            _git_command('rev-parse', 'HEAD'), cwd=PROJECT_ROOT
+            _git_command('rev-parse', 'HEAD'), cwd=PROJECT_ROOT,
+            stderr=subprocess.PIPE,
         ).decode('ascii').strip()
         tracked_diff = subprocess.check_output(
-            _git_command('diff', '--binary', 'HEAD', '--'), cwd=PROJECT_ROOT
+            _git_command('diff', '--binary', 'HEAD', '--'), cwd=PROJECT_ROOT,
+            stderr=subprocess.PIPE,
         )
         untracked_output = subprocess.check_output(
             _git_command('ls-files', '--others', '--exclude-standard', '-z'),
             cwd=PROJECT_ROOT,
+            stderr=subprocess.PIPE,
         )
     except (OSError, subprocess.CalledProcessError):
         return 'unknown', None, None
@@ -326,7 +329,7 @@ def _reuse_checkpoint_source(config, cached):
 
 
 def _completion_policy(resolved):
-    return {
+    policy = {
         'inference_task': 'joint_completion',
         'window_policy': 'non_overlapping_f16',
         'mask_policy': str(
@@ -345,6 +348,9 @@ def _completion_policy(resolved):
             resolved['checkpoint_identity_policy']
         ),
     }
+    if resolved['coordinate_transform_mode'] == TRANSFORM_MODE:
+        policy['coordinate_anchor_policy'] = ANCHOR_POLICY
+    return policy
 
 
 def prepare_completion_runtime(config, runtime=None, load_model=True):

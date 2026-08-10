@@ -71,13 +71,15 @@ external_completion_export/
 | `data_root` | SiC 数据根目录，必须包含 train-only demonstration pool。 |
 | `device` | 通常为 `cuda:0`；CPU 仅适合接口测试。 |
 | `dry_run` | `True` 校验 plan 与 checkpoint 身份且不加载模型；`False` 运行真实 GPU 推理。 |
-| `resume` | `True` 时仅复用通过 query、shape、finite、checkpoint、prompt pool、source config 和 completion policy 校验的已有结果；Git revision 差异不使结果失效。 |
+| `resume` | `True` 时仅复用通过 query、shape、finite、checkpoint、prompt pool、source config 和 completion policy 校验的已有结果；completion policy 包含语义锚点身份，因此旧 root-only 适配器结果会被拒绝；Git revision 差异不使结果失效。 |
 | `strict` | `True` 时 job 失败后先保存 summary，再抛出异常。 |
 | `continue_on_error` | 仅在 `strict=False` 时继续后续 job。 |
 | `mask_policy` | `strict_official_mc` 拒绝官方 MC 分布外 mask；`allow_ood_explicit` 允许论文遮挡并记录 OOD 原因。 |
 | `demonstration_seed` | train demonstration 的确定性种子。 |
 | `demonstration_selection_policy` | 正式使用 `per_sample_fixed`，同一 F64 sample 的四个 F16 window 共用一个 demonstration。 |
-| `coordinate_transform_mode` | 正式使用 `project_h36m17_prompt_aligned_v1`，执行冻结的关节、轴、root 和尺度转换。 |
+| `coordinate_transform_mode` | 正式值继续使用 `project_h36m17_prompt_aligned_v1` 作为跨仓库契约标识。其唯一当前实现执行冻结的关节/轴转换、成对可见语义锚点和一个 F64 可见骨段尺度，不再提供旧 root-only 实现的选择分支。 |
+
+对于每个 F64 sample，适配器按固定顺序选择 query/prompt 成对锚点：pelvis 或双髋中点、中心躯干、上躯干、双肩中点、固定排序可见关节质心。这样可以在不伪造 pelvis 观测、也不读取 clean/GT 数据的前提下运行显式 OOD 的 `bottom` mask。四个 F16 窗口共享同一条锚点轨迹和尺度；完全不可观测或几何支持不足的样本仍会明确失败。
 
 执行：
 

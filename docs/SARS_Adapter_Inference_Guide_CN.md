@@ -60,7 +60,7 @@ manifest 只保存相对文件名。跨电脑时整体复制该目录，只需�
 - `mask_policy`：官方 MC 严格支持或显式 OOD 研究模式。
 - `demonstration_seed`：train-only demonstration 的确定性选择 seed。
 - `demonstration_selection_policy`：正式比较使用 `per_sample_fixed`，四个窗口共享一个 train demonstration。
-- `coordinate_transform_mode`：正式 SARS-Inter 比较使用 `project_h36m17_prompt_aligned_v1`；`identity_h36m17` 只用于复现历史结果。
+- `coordinate_transform_mode`：正式 SARS-Inter 比较使用 `project_h36m17_prompt_aligned_v1`。该字符串只保留为跨仓库数据契约标识；适配器内部只有当前实现，不再提供旧 root-only 实现的选择分支。`identity_h36m17` 仅用于复现历史结果。
 
 这两个参数被有意绑定：正式坐标模式必须使用 `per_sample_fixed`，旧版 `identity_h36m17` 必须使用 `per_window`。组合不匹配时程序会明确报错，不会静默改变历史行为。
 
@@ -78,11 +78,14 @@ Query 的坐标契约必须显式声明 `joint_order=h36m17_sars_inter_project_o
 
 1. 把项目的左腿/右腿和右臂/左臂分组置换到 SiC/MotionBERT H36M17 顺序。
 2. 使用 `(x, y_depth, z_height) -> (x, z_height, -y_depth)` 把项目 Z-up 坐标旋转到 SiC Y-up 空间。
-3. 只根据 query 可见坐标估计一条 F64 root 轨迹和一个可见骨段尺度。
-4. 将 query 对齐到选定的 train demonstration，运行四个 F16 窗口，再对输出执行逆变换。
-5. 精确恢复项目空间中的全部可见坐标。
+3. 只根据 query 可见坐标，为整个 F64 sample 确定一种语义锚点。固定优先级为 pelvis/双髋中点、中心躯干、上躯干、双肩中点、固定排序可见关节质心；train demonstration 使用语义相同的关节或关节集合。
+4. 对缺失的锚点帧进行时间插值，并在序列边界使用最近的可见锚点延伸；四个 F16 窗口共享同一条 F64 锚点轨迹和同一个可见骨段尺度。
+5. 将 query 对齐到选定的 train demonstration，运行四个 F16 窗口，再对输出执行逆变换。
+6. 精确恢复项目空间中的全部可见坐标。
 
-结果会记录关节置换、轴矩阵、root hash、sample/reference scale、prompt identity/hash、prompt 池 manifest hash/count、source config hash、checkpoint 训练身份、缺失关节窗口边界诊断、仓库身份和 checkpoint SHA256。Prompt 选择只使用 `masked_keypoint + missing_mask` 的稳定哈希，不解析 sample ID、标签或数据集名称。
+结果会记录关节置换、轴矩阵、语义锚点模式/关节/hash、sample/reference scale、prompt identity/hash、prompt 池 manifest hash/count、source config hash、checkpoint 训练身份、缺失关节窗口边界诊断、仓库身份和 checkpoint SHA256。稳定的 completion policy 会写入 `coordinate_anchor_policy=paired_visible_semantic_anchor`，因此 `resume=True` 不会静默复用旧 root-only 适配器生成的结果。Prompt 选择只使用 `masked_keypoint + missing_mask` 的稳定哈希，不解析 sample ID、标签或数据集名称。
+
+同时遮挡 pelvis 和双髋的 `bottom` 不属于 SiC 官方 MC 随机 mask 分布。使用 `mask_policy=allow_ood_explicit` 时，适配器会使用语义对应的可见躯干或肩部锚点，并继续记录 OOD 原因；这只表示允许完成公平比较，不代表把该遮挡描述为分布内样本。若整个 sample 没有可用语义锚点，或可见骨段不足以估计尺度，程序仍会明确拒绝。
 
 ## 自获数据与 NW-UCLA 运行方式
 

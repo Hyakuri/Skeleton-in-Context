@@ -2,9 +2,11 @@ import copy
 import hashlib
 import json
 import pickle
+import subprocess
 import tempfile
 import unittest
 import os
+from unittest import mock
 
 import numpy as np
 import torch
@@ -25,6 +27,7 @@ from sars_adapter.inference import (
 )
 from sars_adapter.run_completion import (
     EXTERNAL_PICKLE_PROTOCOL,
+    _completion_policy,
     _repository_identity,
     _resolve_demonstration_selection_policy,
     _validate_formal_coordinate_contract,
@@ -205,6 +208,24 @@ class _PromptTargetModel(torch.nn.Module):
 
 
 class InferenceAdapterTest(unittest.TestCase):
+    def test_completion_policy_records_semantic_anchor_identity(self):
+        config = build_direct_run_config()
+
+        policy = _completion_policy(config)
+
+        self.assertEqual(
+            policy['coordinate_anchor_policy'],
+            'paired_visible_semantic_anchor',
+        )
+
+    def test_identity_completion_policy_does_not_claim_anchor_usage(self):
+        config = build_direct_run_config()
+        config['coordinate_transform_mode'] = 'identity_h36m17'
+
+        policy = _completion_policy(config)
+
+        self.assertNotIn('coordinate_anchor_policy', policy)
+
     def test_formal_contract_requires_explicit_project_joint_order(self):
         contract = {
             'skeleton': 'H36M17',
@@ -243,6 +264,19 @@ class InferenceAdapterTest(unittest.TestCase):
         self.assertEqual(len(commit), 40)
         self.assertIsInstance(dirty, bool)
         self.assertEqual(len(worktree_hash), 64)
+
+    @mock.patch('sars_adapter.run_completion.subprocess.check_output')
+    def test_repository_identity_captures_git_stderr(self, check_output):
+        check_output.side_effect = [b'a' * 40 + b'\n', b'', b'']
+
+        commit, dirty, worktree_hash = _repository_identity()
+
+        self.assertEqual(commit, 'a' * 40)
+        self.assertFalse(dirty)
+        self.assertEqual(len(worktree_hash), 64)
+        self.assertEqual(check_output.call_count, 3)
+        for call in check_output.call_args_list:
+            self.assertEqual(call[1]['stderr'], subprocess.PIPE)
 
     def test_direct_config_defaults_to_formal_coordinate_adapter(self):
         config = build_direct_run_config()
@@ -511,6 +545,49 @@ class InferenceAdapterTest(unittest.TestCase):
         self.assertGreater(
             metadata['boundary_diagnostics'][0]['missing_joint_count'], 0
         )
+
+    def test_formal_bottom_mask_reaches_model_without_unmasking_root(self):
+        masked = np.zeros((1, 64, 17, 3), dtype=np.float32)
+        for joint in range(17):
+            masked[0, :, joint] = [joint * 0.1, joint * 0.03, joint * 0.07]
+        missing = np.zeros((1, 64, 17), dtype=bool)
+        missing[:, :, :8] = True
+        masked[missing] = 0.0
+
+        demo_input = np.zeros((16, 17, 3), dtype=np.float32)
+        demo_target = np.zeros((16, 17, 3), dtype=np.float32)
+        for joint in range(17):
+            demo_input[:, joint] = [joint * 0.05, joint * 0.04, joint * 0.02]
+            demo_target[:, joint] = [joint * 0.06, joint * 0.05, joint * 0.03]
+
+        def prompt_provider(sample_index, window_index, window_mask):
+            return demo_input, demo_target, {
+                'source_split': 'train',
+                'identity': 'bottom-demo',
+                'sha256': 'b' * 64,
+                'selection_policy': 'per_sample_fixed',
+            }
+
+        model = _PromptTargetModel()
+        completed, metadata = complete_f64_with_model(
+            model=model,
+            masked_keypoint=masked,
+            missing_mask=missing,
+            prompt_provider=prompt_provider,
+            device='cpu',
+            mask_policy='allow_ood_explicit',
+            coordinate_transform_mode='project_h36m17_prompt_aligned_v1',
+        )
+
+        self.assertEqual(len(model.queries), 4)
+        for query in model.queries:
+            self.assertTrue(np.all(query[:, :16, :8] == 0.0))
+        np.testing.assert_array_equal(completed[~missing], masked[~missing])
+        self.assertTrue(np.isfinite(completed).all())
+        transform = metadata['sample_transforms'][0]
+        self.assertEqual(transform['anchor_mode'], 'upper_torso')
+        self.assertEqual(transform['anchor_joint_ids'], [8])
+        self.assertEqual(metadata['observed_restoration_max_abs_error'], 0.0)
 
     def test_result_package_binds_query_and_records_runtime_policy(self):
         query = _query()
