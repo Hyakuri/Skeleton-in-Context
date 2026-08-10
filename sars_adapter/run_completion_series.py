@@ -29,11 +29,14 @@ from sars_adapter.series_contracts import load_run_plan
 
 def build_direct_run_config():
     """集中配置 public plan 批量执行入口。"""
+    
+    SARS_INTER_1stRecogResults_dirname = "SiC_MC_CustomDataset_20260810141623"
+    
     return {
         'checkpoint_source_mode': 'identity_manifest',  # 正式使用身份清单；smoke 可改为 direct_path。
         'checkpoint_identity_manifest_path': r"K:\ExternalCompletionBaselines\Skeleton-in-Context\checkpoints\sic_mc_20260806232122\frozen_checkpoints\checkpoint_identity.json",  # 正式 bundle 中的身份清单。
-        'plan_path': r"\\?\K:\SARS-Inter_DL\PP_Informatics_MajorRevision\SiC_MC_20260810_CustomDataset\custom__sic_custom_all_split\external_completion_export\public_query\external_completion_run_plan.json",  # 仅含公开 query job 的 V1 plan。
-        'output_root': r"\\?\K:\SARS-Inter_DL\PP_Informatics_MajorRevision\SiC_MC_20260810_CustomDataset\sic_completion_results",  # 所有相对结果路径的安全根目录。
+        'plan_path': rf"\\?\K:\SARS-Inter_DL\PP_Informatics_MajorRevision\{SARS_INTER_1stRecogResults_dirname}\custom__sic_custom_all_split\external_completion_export\public_query\external_completion_run_plan.json",  # 仅含公开 query job 的 V1 plan。
+        'output_root': rf"\\?\K:\SARS-Inter_DL\PP_Informatics_MajorRevision\{SARS_INTER_1stRecogResults_dirname}\sic_completion_results",  # 所有相对结果路径的安全根目录。
         'checkpoint_path': None,  # 仅 direct_path 冒烟模式填写；程序自动计算 SHA256。
         'source_config': None,  # 仅 direct_path 填写，且必须与 checkpoint 来自同一次训练。
         'checkpoint_identity_policy': 'require_mc_only',  # identity_manifest 固定 require_mc_only；allow_legacy 只允许 direct_path 旧权重冒烟。
