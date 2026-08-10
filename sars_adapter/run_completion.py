@@ -45,7 +45,6 @@ def build_direct_run_config():
         'checkpoint_source_mode': 'identity_manifest',  # 正式使用身份清单；smoke 可改为 direct_path。
         'checkpoint_identity_manifest_path': '<SIC_CHECKPOINT_IDENTITY_JSON>',  # 正式 bundle 中的身份清单。
         'dry_run': True,  # True=仅检查输入；False=执行真实 GPU 推理。
-        'require_clean_repository': True,  # True=正式补值只允许无未提交改动的仓库。
         'query_path': '<COMPLETION_QUERY_PATH>',  # SARS-Inter V2 query，不得传评价 sidecar。
         'checkpoint_path': '<SIC_CHECKPOINT_PATH>',  # 仅 direct_path 冒烟模式填写；程序自动计算 SHA256。
         'source_config': '<SIC_EFFECTIVE_CONFIG_PATH>',  # 仅 direct_path 填写，且必须与 checkpoint 来自同一次训练。
@@ -192,16 +191,20 @@ def build_result_package(
 
 
 def _repository_identity():
-    commit = subprocess.check_output(
-        _git_command('rev-parse', 'HEAD'), cwd=PROJECT_ROOT
-    ).decode('ascii').strip()
-    tracked_diff = subprocess.check_output(
-        _git_command('diff', '--binary', 'HEAD', '--'), cwd=PROJECT_ROOT
-    )
-    untracked_output = subprocess.check_output(
-        _git_command('ls-files', '--others', '--exclude-standard', '-z'),
-        cwd=PROJECT_ROOT,
-    )
+    """尽力记录仓库状态；Git 元信息不可用时不阻断实验执行。"""
+    try:
+        commit = subprocess.check_output(
+            _git_command('rev-parse', 'HEAD'), cwd=PROJECT_ROOT
+        ).decode('ascii').strip()
+        tracked_diff = subprocess.check_output(
+            _git_command('diff', '--binary', 'HEAD', '--'), cwd=PROJECT_ROOT
+        )
+        untracked_output = subprocess.check_output(
+            _git_command('ls-files', '--others', '--exclude-standard', '-z'),
+            cwd=PROJECT_ROOT,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return 'unknown', None, None
     untracked_paths = [
         value.decode('utf-8', errors='surrogateescape')
         for value in untracked_output.split(b'\0')
@@ -285,9 +288,8 @@ def _normalize_runtime_options(config):
         'require_mc_only', 'allow_legacy'
     }:
         raise ValueError('unsupported checkpoint identity policy')
-    resolved['require_clean_repository'] = bool(
-        resolved.get('require_clean_repository', True)
-    )
+    # 兼容旧配置字段，但 Git revision 只作为 provenance 记录，不再阻断运行。
+    resolved['require_clean_repository'] = False
     transform_mode = resolved.get('coordinate_transform_mode')
     if transform_mode not in {'identity_h36m17', TRANSFORM_MODE}:
         raise ValueError('unsupported coordinate_transform_mode')
@@ -375,7 +377,6 @@ def prepare_completion_runtime(config, runtime=None, load_model=True):
         int(resolved.get('demonstration_seed', 42)),
         str(resolved.get('mask_policy', 'allow_ood_explicit')),
         resolved['checkpoint_identity_policy'],
-        bool(resolved['require_clean_repository']),
     )
     previous = shared.get('runtime_signature')
     if previous is not None and tuple(previous) != signature:
@@ -387,13 +388,6 @@ def prepare_completion_runtime(config, runtime=None, load_model=True):
         )
     if 'repository_identity' not in shared:
         shared['repository_identity'] = _repository_identity()
-    if (
-        resolved['require_clean_repository']
-        and bool(shared['repository_identity'][1])
-    ):
-        raise ValueError(
-            'formal SiC completion requires a clean repository worktree'
-        )
     if 'checkpoint_sha256' not in shared:
         shared['checkpoint_sha256'] = resolved['checkpoint_sha256']
     if (
@@ -420,7 +414,7 @@ def prepare_completion_runtime(config, runtime=None, load_model=True):
             'adapter_fork': {
                 'repository_url': ADAPTER_FORK_REPOSITORY_URL,
                 'commit': commit,
-                'repository_dirty': bool(dirty),
+                'repository_dirty': dirty,
                 'repository_worktree_sha256': worktree_hash,
             },
             'checkpoint': {
@@ -465,8 +459,6 @@ def prepare_completion_runtime(config, runtime=None, load_model=True):
             != shared['prompt_pool']['source_config_sha256']
         ):
             raise RuntimeError('SiC source config changed while loading the model')
-        if _repository_identity() != shared['repository_identity']:
-            raise RuntimeError('SiC repository changed while loading the model')
     return shared
 
 
@@ -503,8 +495,6 @@ def verify_completion_runtime_assets(config, runtime):
                     field
                 )
             )
-    if _repository_identity() != tuple(shared.get('repository_identity') or ()):
-        raise RuntimeError('SiC repository changed during completion series')
     return True
 
 
@@ -579,10 +569,6 @@ def run_completion(config, runtime=None):
     )
     elapsed = time.perf_counter() - started
     final_identity = _repository_identity()
-    if final_identity != (commit, dirty, worktree_hash):
-        raise RuntimeError(
-            'repository worktree changed during SiC inference; result was not saved'
-        )
     checkpoint_hash = shared['checkpoint_sha256']
     runtime = {
         'total_seconds': float(elapsed),
@@ -606,6 +592,9 @@ def run_completion(config, runtime=None):
         ],
         'repository_dirty': dirty,
         'repository_worktree_sha256': worktree_hash,
+        'repository_changed_during_execution': (
+            final_identity != (commit, dirty, worktree_hash)
+        ),
     }
     package = build_result_package(
         query=query,

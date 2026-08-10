@@ -43,7 +43,6 @@ def build_direct_run_config():
         'data_root': r"K:\ExternalCompletionBaselines\Skeleton-in-Context\data",  # 只读取 3DPW_MC/train demonstrations。
         'device': 'cuda:0',  # 可填写 cuda:0 或 cpu。
         'dry_run': False,  # True=校验 plan 与 checkpoint 身份并记录 planned，不加载模型。
-        'require_clean_repository': True,  # True=真实批处理拒绝 dirty worktree。
         'resume': True,  # True=仅跳过通过完整绑定校验的已有结果。
         'strict': True,  # True=失败且未启用 continue_on_error 时抛错。
         'continue_on_error': False,  # True=记录失败并继续后续 job。
@@ -105,10 +104,16 @@ def _validate_existing_result(path, query, expected_provenance):
         raise ValueError('existing completion sample_order mismatch')
     if result.get('checkpoint_identity') != expected_provenance['checkpoint']['sha256']:
         raise ValueError('existing completion checkpoint identity mismatch')
-    if result.get('repository_commit') != expected_provenance['adapter_fork']['commit']:
-        raise ValueError('existing completion adapter commit mismatch')
-    if result.get('provenance') != expected_provenance:
-        raise ValueError('existing completion provenance mismatch')
+    result_provenance = result.get('provenance') or {}
+    for section_name in ('checkpoint', 'prompt_pool', 'completion_policy'):
+        if result_provenance.get(section_name) != expected_provenance.get(
+            section_name
+        ):
+            raise ValueError(
+                'existing completion stable provenance mismatch: {}'.format(
+                    section_name
+                )
+            )
     if result.get('method_name') != 'skeleton_in_context':
         raise ValueError('existing completion method identity mismatch')
     for field_name in ('dataset_profile', 'source_split', 'coordinate_contract'):
@@ -131,7 +136,10 @@ def _validate_existing_result(path, query, expected_provenance):
     return result
 
 
-def _summary_payload(plan, records, status_path, summary_path, started_at):
+def _summary_payload(
+    plan, records, status_path, summary_path, started_at,
+    provenance_warnings=None,
+):
     counts = {}
     for record in records:
         status = str(record.get('status'))
@@ -150,13 +158,18 @@ def _summary_payload(plan, records, status_path, summary_path, started_at):
         'updated_at_unix': float(time.time()),
         'status_path': status_path,
         'summary_path': summary_path,
+        'provenance_warnings': list(provenance_warnings or []),
         'records': copy.deepcopy(records),
     }
 
 
-def _save_state(plan, records, status_path, summary_path, started_at):
+def _save_state(
+    plan, records, status_path, summary_path, started_at,
+    provenance_warnings=None,
+):
     summary = _summary_payload(
-        plan, records, status_path, summary_path, started_at
+        plan, records, status_path, summary_path, started_at,
+        provenance_warnings=provenance_warnings,
     )
     status_payload = {
         'format': 'sars_inter_external_completion_series_status',
@@ -183,43 +196,41 @@ def _verify_plan_unchanged(plan_path, expected_hash):
 
 
 def _validate_plan_runtime_profile(method_profile, provenance):
-    """确保 SARS-Inter 固定的外部方法身份与当前 SiC 运行时一致。"""
+    """严格校验实验资产，并将 Git revision 差异降级为提示。"""
     if str(method_profile.get('method_name') or '') != 'skeleton_in_context':
         raise ValueError('run-plan method_name is not skeleton_in_context')
-    expected_pairs = (
+    revision_pairs = (
         (
             'repository_url',
             provenance['adapter_fork']['repository_url'],
-            'adapter repository URL',
+            'adapter_repository_url_differs_from_plan',
         ),
         (
             'repository_commit',
             provenance['adapter_fork']['commit'],
-            'adapter repository commit',
+            'adapter_commit_differs_from_plan',
         ),
         (
             'upstream_repository_url',
             provenance['official_upstream']['repository_url'],
-            'upstream repository URL',
+            'upstream_repository_url_differs_from_plan',
         ),
         (
             'upstream_repository_commit',
             provenance['official_upstream']['commit'],
-            'upstream repository commit',
+            'upstream_commit_differs_from_plan',
         ),
     )
-    for field_name, actual_value, label in expected_pairs:
+    warnings = []
+    for field_name, actual_value, warning_name in revision_pairs:
         expected_value = str(method_profile.get(field_name) or '').strip()
-        if not expected_value:
-            raise ValueError('run-plan method_profile.{} is required'.format(
-                field_name
-            ))
-        if expected_value != str(actual_value):
-            raise ValueError(
-                'run-plan {} mismatch: expected={}, runtime={}'.format(
-                    label, expected_value, actual_value
-                )
-            )
+        if expected_value and expected_value != str(actual_value):
+            warnings.append(warning_name)
+    adapter = provenance.get('adapter_fork') or {}
+    if adapter.get('repository_dirty') is True:
+        warnings.append('repository_worktree_dirty')
+    if not adapter.get('commit') or adapter.get('commit') == 'unknown':
+        warnings.append('repository_identity_unavailable')
     expected_checkpoint = str(
         method_profile.get('checkpoint_sha256') or ''
     ).strip().lower()
@@ -232,6 +243,7 @@ def _validate_plan_runtime_profile(method_profile, provenance):
                 expected_checkpoint, actual_checkpoint
             )
         )
+    return sorted(set(warnings))
 
 
 def run_completion_series(config, completion_runner=run_completion):
@@ -295,7 +307,7 @@ def run_completion_series(config, completion_runner=run_completion):
         resolved, runtime=shared_runtime, load_model=False
     )
     expected_provenance = shared_runtime['provenance']
-    _validate_plan_runtime_profile(
+    provenance_warnings = _validate_plan_runtime_profile(
         plan['method_profile'], expected_provenance
     )
     strict = bool(resolved.get('strict', True))
@@ -330,7 +342,8 @@ def run_completion_series(config, completion_runner=run_completion):
                     'skipped_existing', output_path,
                 )
                 _save_state(
-                    plan, records, status_path, summary_path, started_at
+                    plan, records, status_path, summary_path, started_at,
+                    provenance_warnings=provenance_warnings,
                 )
                 continue
             except Exception as error:
@@ -340,7 +353,10 @@ def run_completion_series(config, completion_runner=run_completion):
 
         records.append(record)
         _progress(index, total, job['job_id'], 'running', output_path)
-        _save_state(plan, records, status_path, summary_path, started_at)
+        _save_state(
+            plan, records, status_path, summary_path, started_at,
+            provenance_warnings=provenance_warnings,
+        )
         try:
             job_config = copy.deepcopy(resolved)
             job_config.update({
@@ -365,16 +381,23 @@ def run_completion_series(config, completion_runner=run_completion):
                 'error': '{}: {}'.format(type(error).__name__, error),
             })
             _progress(index, total, job['job_id'], 'failed', output_path)
-            _save_state(plan, records, status_path, summary_path, started_at)
+            _save_state(
+                plan, records, status_path, summary_path, started_at,
+                provenance_warnings=provenance_warnings,
+            )
             if strict and not continue_on_error:
                 raise
             continue
-        _save_state(plan, records, status_path, summary_path, started_at)
+        _save_state(
+            plan, records, status_path, summary_path, started_at,
+            provenance_warnings=provenance_warnings,
+        )
 
     _verify_plan_unchanged(plan_path, original_plan_hash)
     verify_completion_runtime_assets(resolved, shared_runtime)
     return _save_state(
-        plan, records, status_path, summary_path, started_at
+        plan, records, status_path, summary_path, started_at,
+        provenance_warnings=provenance_warnings,
     )
 
 

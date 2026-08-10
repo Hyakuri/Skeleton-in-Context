@@ -19,7 +19,7 @@ masked MMAction2 dataset
 
 ## Required Frozen Inputs
 
-- SiC repository commit and clean-worktree hash.
+- SiC repository URL, commit, dirty state, and worktree hash as record-only provenance.
 - Portable SiC checkpoint identity bundle and manifest hash.
 - SiC checkpoint and run-specific `effective_config.yaml` SHA256 values recorded by that manifest.
 - Official `3DPW_MC/train` prompt-pool manifest hash/count.
@@ -141,8 +141,7 @@ Edit `build_direct_run_config()` in the series runner:
 | `data_root` | SiC data root containing the train-only demonstration pool. |
 | `device` | Inference device, normally `cuda:0`. |
 | `dry_run` | `True` validates the plan and checkpoint identity without loading the model; `False` performs inference. |
-| `require_clean_repository` | Formal default `True`; rejects an adapter worktree with uncommitted changes. |
-| `resume` | Reuses an existing result only after complete query, shape, finite-value, checkpoint, repository, and provenance validation. |
+| `resume` | Reuses an existing result only after query, shape, finite-value, checkpoint, prompt-pool, source-config, and completion-policy validation. Git revision metadata does not invalidate a result. |
 | `strict` | Raises after a failed job. A failure summary is still saved first. |
 | `continue_on_error` | Continues later jobs only when `strict=False`; never turns a failed record into success. |
 | `mask_policy` | `strict_official_mc` rejects unsupported masks; `allow_ood_explicit` runs the paper masks and records explicit OOD reasons. |
@@ -158,9 +157,10 @@ Run:
 
 Progress is written atomically to a status JSON and printed as
 `[current/total] job_id=... status=...`. The model is loaded once per series.
-If checkpoint, prompt-pool, source-config, repository, query, or existing-result
-content changes during the run, the series fails instead of publishing mixed
-provenance.
+If checkpoint, prompt-pool, source-config, query, or existing-result content
+changes during the run, the series fails instead of publishing mixed artifacts.
+Repository revision and dirty-worktree information remain recorded in provenance
+and `provenance_warnings`, but do not block experimental execution.
 
 ## Completion Scopes
 

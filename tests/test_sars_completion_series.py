@@ -279,37 +279,74 @@ class CompletionSeriesTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'canonical'):
             build_run_plan([self._job('noncanonical')], noncanonical)
 
-    def test_formal_execution_rejects_dirty_repository(self):
+    def test_formal_execution_allows_dirty_repository_as_record_only(self):
         plan_path, plan = self._write_plan([self._job('dirty')])
         commit = plan['method_profile']['repository_commit']
+        selections = []
         with mock.patch(
             'sars_adapter.run_completion._repository_identity',
             return_value=(commit, True, 'f' * 64),
+        ), mock.patch(
+            'sars_adapter.run_completion._load_model', return_value=object()
+        ), mock.patch(
+            'sars_adapter.run_completion.build_train_prompt_provider',
+            side_effect=self._fake_prompt_provider(selections),
+        ), mock.patch(
+            'sars_adapter.run_completion.complete_f64_with_model',
+            side_effect=self._fake_completion,
         ):
-            with self.assertRaisesRegex(ValueError, 'clean repository'):
-                run_completion_series(self._config(
-                    plan_path, require_clean_repository=True
-                ))
+            summary = run_completion_series(self._config(
+                plan_path, require_clean_repository=True
+            ))
 
-    def test_execution_rejects_plan_for_different_adapter_commit(self):
+        self.assertEqual(summary['completed_count'], 1)
+        self.assertIn('repository_worktree_dirty', summary['provenance_warnings'])
+
+    def test_execution_allows_plan_for_different_adapter_commit(self):
         plan_path, plan = self._write_plan([self._job('wrong-adapter')])
         plan['method_profile']['repository_commit'] = '0' * 40
         plan = build_run_plan(plan['jobs'], plan['method_profile'])
         with open(plan_path, 'w', encoding='utf-8') as stream:
             json.dump(plan, stream, ensure_ascii=False, indent=2)
 
-        with self.assertRaisesRegex(ValueError, 'adapter.*commit'):
-            run_completion_series(self._config(plan_path))
+        with mock.patch(
+            'sars_adapter.run_completion._load_model', return_value=object()
+        ), mock.patch(
+            'sars_adapter.run_completion.build_train_prompt_provider',
+            side_effect=self._fake_prompt_provider([]),
+        ), mock.patch(
+            'sars_adapter.run_completion.complete_f64_with_model',
+            side_effect=self._fake_completion,
+        ):
+            summary = run_completion_series(self._config(plan_path))
+        self.assertEqual(summary['completed_count'], 1)
+        self.assertIn(
+            'adapter_commit_differs_from_plan',
+            summary['provenance_warnings'],
+        )
 
-    def test_execution_rejects_plan_for_different_upstream_commit(self):
+    def test_execution_allows_plan_for_different_upstream_commit(self):
         plan_path, plan = self._write_plan([self._job('wrong-upstream')])
         plan['method_profile']['upstream_repository_commit'] = '0' * 40
         plan = build_run_plan(plan['jobs'], plan['method_profile'])
         with open(plan_path, 'w', encoding='utf-8') as stream:
             json.dump(plan, stream, ensure_ascii=False, indent=2)
 
-        with self.assertRaisesRegex(ValueError, 'upstream.*commit'):
-            run_completion_series(self._config(plan_path))
+        with mock.patch(
+            'sars_adapter.run_completion._load_model', return_value=object()
+        ), mock.patch(
+            'sars_adapter.run_completion.build_train_prompt_provider',
+            side_effect=self._fake_prompt_provider([]),
+        ), mock.patch(
+            'sars_adapter.run_completion.complete_f64_with_model',
+            side_effect=self._fake_completion,
+        ):
+            summary = run_completion_series(self._config(plan_path))
+        self.assertEqual(summary['completed_count'], 1)
+        self.assertIn(
+            'upstream_commit_differs_from_plan',
+            summary['provenance_warnings'],
+        )
 
     def test_execution_rejects_plan_for_different_checkpoint_before_model_load(self):
         plan_path, plan = self._write_plan([self._job('wrong-checkpoint')])
@@ -406,6 +443,27 @@ class CompletionSeriesTest(unittest.TestCase):
         self.assertEqual(
             len(result['provenance']['prompt_pool']['manifest_sha256']), 64
         )
+        result['repository_commit'] = '0' * 40
+        result['provenance']['adapter_fork']['commit'] = '0' * 40
+        result['provenance']['adapter_fork']['repository_dirty'] = True
+        result['provenance']['adapter_fork'][
+            'repository_worktree_sha256'
+        ] = '1' * 64
+        result['result_hash'] = _package_hash(result, 'result_hash')
+        with open(result_path, 'wb') as stream:
+            pickle.dump(result, stream, protocol=4)
+
+        with mock.patch(
+            'sars_adapter.run_completion._load_model',
+            side_effect=AssertionError(
+                'revision-only resume must not load model'
+            ),
+        ):
+            revision_resumed = run_completion_series(self._config(plan_path))
+        self.assertEqual(
+            revision_resumed['records'][0]['status'], 'skipped_existing'
+        )
+
         result['provenance']['checkpoint']['sha256'] = '0' * 64
         result['result_hash'] = _package_hash(result, 'result_hash')
         with open(result_path, 'wb') as stream:

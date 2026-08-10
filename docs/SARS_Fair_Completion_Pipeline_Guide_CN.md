@@ -23,15 +23,14 @@ SARS-Inter masked dataset
 
 ## 必须冻结的身份
 
-- SiC adapter fork URL、40 位 commit 和 clean-worktree 状态。
-- 官方 upstream URL 与 40 位 commit。
+- SiC adapter fork 和官方 upstream 的 URL、commit、dirty/worktree 状态仅作为追踪信息。
 - 可移植 SiC checkpoint identity bundle 及其 manifest hash。
 - 由 manifest 记录的 SiC checkpoint 与本次训练 `effective_config.yaml` SHA256。
 - `3DPW_MC/train` prompt pool 的文件数量和 manifest SHA256。
 - demonstration seed、选择策略、mask policy 和坐标转换模式。
 
-正式运行默认拒绝 dirty repository；运行开始和结束都会复核 checkpoint、配置、
-prompt pool 与仓库身份，避免在同一批结果中混入不同策略。
+正式运行会严格复核 checkpoint、配置、prompt pool 和数据契约，避免在同一批结果中
+混入不同实验资产。仓库 revision 与 dirty 状态只记录并提示，不阻断实验执行。
 
 ## 第一步：SARS-Inter 导出
 
@@ -72,8 +71,7 @@ external_completion_export/
 | `data_root` | SiC 数据根目录，必须包含 train-only demonstration pool。 |
 | `device` | 通常为 `cuda:0`；CPU 仅适合接口测试。 |
 | `dry_run` | `True` 校验 plan 与 checkpoint 身份且不加载模型；`False` 运行真实 GPU 推理。 |
-| `require_clean_repository` | 正式默认 `True`，拒绝未提交修改。 |
-| `resume` | `True` 时仅复用通过全部 hash、shape、finite 和 provenance 校验的已有结果。 |
+| `resume` | `True` 时仅复用通过 query、shape、finite、checkpoint、prompt pool、source config 和 completion policy 校验的已有结果；Git revision 差异不使结果失效。 |
 | `strict` | `True` 时 job 失败后先保存 summary，再抛出异常。 |
 | `continue_on_error` | 仅在 `strict=False` 时继续后续 job。 |
 | `mask_policy` | `strict_official_mc` 拒绝官方 MC 分布外 mask；`allow_ood_explicit` 允许论文遮挡并记录 OOD 原因。 |
@@ -105,7 +103,7 @@ external_completion_export/
 导入器会：
 
 1. 校验 query hash、sample order、dataset/split、H36M17/F64 和有限值。
-2. 校验 adapter/upstream commit、checkpoint、prompt pool 与 clean repository。
+2. 严格校验 checkpoint、prompt pool、source config 和 completion policy；adapter/upstream revision 仅记录。
 3. 只替换 `missing_mask=True` 的坐标。
 4. 精确恢复所有原始可见坐标，误差必须为 0。
 5. 保存 method、scope、runtime、mask policy、OOD 原因和完整 provenance。
