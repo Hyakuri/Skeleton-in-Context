@@ -8,8 +8,13 @@ import os
 import pickle
 import tempfile
 import time
-
+import os.path as osp
+import os, sys
 import numpy as np
+
+ROOT_DIR = osp.join(osp.dirname(osp.abspath(__file__)), os.path.pardir)
+if ROOT_DIR not in sys.path:
+    sys.path.append(ROOT_DIR)
 
 from sars_adapter.contracts import load_completion_query
 from sars_adapter.run_completion import (
@@ -26,15 +31,15 @@ def build_direct_run_config():
     """集中配置 public plan 批量执行入口。"""
     return {
         'checkpoint_source_mode': 'identity_manifest',  # 正式使用身份清单；smoke 可改为 direct_path。
-        'checkpoint_identity_manifest_path': '<SIC_CHECKPOINT_IDENTITY_JSON>',  # 正式 bundle 中的身份清单。
-        'plan_path': '<PUBLIC_RUN_PLAN_JSON>',  # 仅含公开 query job 的 V1 plan。
-        'output_root': '<COMPLETION_RESULT_ROOT>',  # 所有相对结果路径的安全根目录。
-        'checkpoint_path': '<SIC_CHECKPOINT_PATH>',  # 仅 direct_path 冒烟模式填写；程序自动计算 SHA256。
-        'source_config': '<SIC_EFFECTIVE_CONFIG_PATH>',  # 仅 direct_path 填写，且必须与 checkpoint 来自同一次训练。
+        'checkpoint_identity_manifest_path': r"K:\ExternalCompletionBaselines\Skeleton-in-Context\checkpoints\sic_mc_20260806232122\frozen_checkpoints\checkpoint_identity.json",  # 正式 bundle 中的身份清单。
+        'plan_path': r"\\?\K:\SARS-Inter_DL\PP_Informatics_MajorRevision\SiC_MC_20260810_CustomDataset\custom__sic_custom_all_split\external_completion_export\public_query\external_completion_run_plan.json",  # 仅含公开 query job 的 V1 plan。
+        'output_root': r"\\?\K:\SARS-Inter_DL\PP_Informatics_MajorRevision\SiC_MC_20260810_CustomDataset\sic_completion_results",  # 所有相对结果路径的安全根目录。
+        'checkpoint_path': None,  # 仅 direct_path 冒烟模式填写；程序自动计算 SHA256。
+        'source_config': None,  # 仅 direct_path 填写，且必须与 checkpoint 来自同一次训练。
         'checkpoint_identity_policy': 'require_mc_only',  # identity_manifest 固定 require_mc_only；allow_legacy 只允许 direct_path 旧权重冒烟。
-        'data_root': '<SIC_DATA_ROOT>',  # 只读取 3DPW_MC/train demonstrations。
+        'data_root': r"K:\ExternalCompletionBaselines\Skeleton-in-Context\data",  # 只读取 3DPW_MC/train demonstrations。
         'device': 'cuda:0',  # 可填写 cuda:0 或 cpu。
-        'dry_run': True,  # True=校验 plan 与 checkpoint 身份并记录 planned，不加载模型。
+        'dry_run': False,  # True=校验 plan 与 checkpoint 身份并记录 planned，不加载模型。
         'require_clean_repository': True,  # True=真实批处理拒绝 dirty worktree。
         'resume': True,  # True=仅跳过通过完整绑定校验的已有结果。
         'strict': True,  # True=失败且未启用 continue_on_error 时抛错。
