@@ -1,6 +1,8 @@
 import os
 import shutil
 import numpy as np
+import json
+import hashlib
 import argparse
 import errno
 import tensorboardX
@@ -36,14 +38,84 @@ def set_random_seed(seed):
     torch.manual_seed(seed)
 
 
-def save_checkpoint(chk_path, epoch, lr, optimizer, model_pos, min_loss):
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def build_training_identity(
+    config_path, subset_manifest_path, tasks, subset_seed, training_seed
+):
+    """构建可用于恢复校验的训练任务、配置和子集身份。"""
+    tasks = list(tasks)
+    return {
+        'format': 'skeleton_in_context_training_identity',
+        'version': 1,
+        'tasks': tasks,
+        'task_scope': 'single_task' if len(tasks) == 1 else 'multi_task',
+        'subset_seed': int(subset_seed),
+        'training_seed': int(training_seed),
+        'effective_config_sha256': _sha256_file(config_path),
+        'subset_manifest_sha256': _sha256_file(subset_manifest_path),
+    }
+
+
+def validate_checkpoint_training_identity(checkpoint, expected, strict=False):
+    """拒绝任务、配置、训练子集或 seed 不一致的 checkpoint 恢复。"""
+    actual = checkpoint.get('training_identity')
+    if actual is None:
+        if strict:
+            raise ValueError('checkpoint is missing strict training identity')
+        print('WARNING: checkpoint has no training identity; using legacy resume mode.')
+        return
+    if actual != expected:
+        raise ValueError(
+            'checkpoint training identity mismatch: expected={} actual={}'.format(
+                expected, actual
+            )
+        )
+
+
+def capture_rng_state():
+    """保存中断恢复所需的 Python、NumPy 和 Torch 随机状态。"""
+    state = {
+        'python': random.getstate(),
+        'numpy': np.random.get_state(),
+        'torch': torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state['torch_cuda'] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(state):
+    """恢复 checkpoint 中存在的随机状态；旧 checkpoint 保持兼容。"""
+    if not state:
+        return
+    random.setstate(state['python'])
+    np.random.set_state(state['numpy'])
+    torch.set_rng_state(state['torch'])
+    if torch.cuda.is_available() and state.get('torch_cuda') is not None:
+        torch.cuda.set_rng_state_all(state['torch_cuda'])
+
+
+def save_checkpoint(
+    chk_path, epoch, lr, optimizer, model_pos, min_loss,
+    evaluation_state=None, training_identity=None, rng_state=None,
+):
     print('\tSaving checkpoint to', chk_path)
     torch.save({
         'epoch': epoch + 1,
         'lr': lr,
         'optimizer': optimizer.state_dict(),
         'model_pos': model_pos.state_dict(),
-        'min_loss' : min_loss
+        'min_loss': min_loss,
+        'evaluation_state': evaluation_state,
+        'training_identity': training_identity,
+        'rng_state': rng_state,
     }, chk_path)
 
 
@@ -118,7 +190,12 @@ def evaluate_motion_completion(args, test_loader, model, epoch=None):
                 gt_one_sample = target[i]           # (clip_len, 17, 3)
                 query_input_one_sample = query_batch[i, :args.data.clip_len]    # (clip_len, 17, 3)
                 masked_frame_idx = torch.all(query_input_one_sample[:,1:].sum(dim=(0,2), keepdim=True) == 0, dim=0).squeeze(-1)
-                masked_frame_idx = torch.cat([torch.tensor([False]).cuda(), masked_frame_idx])
+                masked_frame_idx = torch.cat([
+                    torch.tensor(
+                        [False], device=query_input_one_sample.device
+                    ),
+                    masked_frame_idx,
+                ])
                 pred_ = pred_one_sample[:, masked_frame_idx]
                 gt_ = gt_one_sample[:, masked_frame_idx]
                 masked_frame_num = pred_.shape[1]
@@ -336,6 +413,18 @@ def train_epoch(args, model_pos, train_loader, losses, optimizer, epoch=None):
             print(f"\tIter: {idx}/{len(train_loader)}; current batch has {task_cnt} samples")
 
 
+def summarize_active_task_scores(active_tasks, task_scores):
+    """校验当前任务评价分数，并计算兼容单任务和多任务的全局分数。"""
+    active_tasks = list(active_tasks)
+    if not active_tasks:
+        raise ValueError('active_tasks must not be empty')
+    missing = [task for task in active_tasks if task not in task_scores]
+    if missing:
+        raise ValueError(f'missing evaluation scores for tasks: {missing}')
+    selected = {task: float(task_scores[task]) for task in active_tasks}
+    return selected, float(np.mean(list(selected.values())))
+
+
 def train_with_config(args, opts):
 
     assert 'bin' not in opts.checkpoint
@@ -343,6 +432,9 @@ def train_with_config(args, opts):
         args.data = args.partial_data
     else:
         args.data = args.full_data
+    if not args.tasks:
+        raise ValueError('At least one training task is required.')
+    primary_task = args.tasks[0]
     print(f'Training on {len(args.tasks)} tasks: {args.tasks}')
     print(f'\nConfigs: {args}')
 
@@ -358,25 +450,66 @@ def train_with_config(args, opts):
     train_writer = tensorboardX.SummaryWriter(os.path.join(opts.checkpoint, "logs"))
 
     print('\nLoading dataset...')
+    num_workers = int(args.get('num_workers', 12))
+    pin_memory = bool(args.get('pin_memory', True))
     trainloader_params = {
           'batch_size': args.batch_size,
           'shuffle': True,
-          'num_workers': 12,
-          'pin_memory': True,
-          'prefetch_factor': 4,
-          'persistent_workers': True
+          'num_workers': num_workers,
+          'pin_memory': pin_memory,
     }
     testloader_params = {
           'batch_size': args.test_batch_size,
           'shuffle': False,
-          'num_workers': 12,
-          'pin_memory': True,
-          'prefetch_factor': 4,
-          'persistent_workers': True
+          'num_workers': num_workers,
+          'pin_memory': pin_memory,
     }
+    if num_workers > 0:
+        prefetch_factor = int(args.get('prefetch_factor', 4))
+        persistent_workers = bool(args.get('persistent_workers', True))
+        trainloader_params.update(
+            prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers,
+        )
+        testloader_params.update(
+            prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers,
+        )
 
 
     train_dataset = MotionDataset3D(args, data_split='train')        
+    subset_manifest = {
+        'format': 'skeleton_in_context_training_subset',
+        'version': 2,
+        'subset_seed': int(args.get('subset_seed', 0)),
+        'data_root': os.path.abspath(args.data.root_path),
+        'task_scope': 'single_task' if len(args.tasks) == 1 else 'multi_task',
+        'tasks': list(args.tasks),
+        'selected_train_files': train_dataset.selection_manifest,
+    }
+    subset_manifest_path = os.path.join(
+        opts.checkpoint, 'training_subset_manifest.json'
+    )
+    if os.path.isfile(subset_manifest_path):
+        with open(subset_manifest_path, 'r') as stream:
+            existing_subset_manifest = json.load(stream)
+        if existing_subset_manifest != subset_manifest:
+            if bool(args.get('strict_training_identity', False)):
+                raise ValueError('existing training subset manifest mismatch')
+            print(
+                'WARNING: existing training subset manifest differs; '
+                'using legacy resume mode.'
+            )
+    else:
+        with open(subset_manifest_path, 'w') as stream:
+            json.dump(subset_manifest, stream, indent=2, sort_keys=True)
+    training_identity = build_training_identity(
+        config_path=opts.config,
+        subset_manifest_path=subset_manifest_path,
+        tasks=args.tasks,
+        subset_seed=args.get('subset_seed', 0),
+        training_seed=opts.seed,
+    )
     train_loader_3d = DataLoader(train_dataset, **trainloader_params)
 
     test_dataset = MotionDataset3D(args, data_split='test', prompt_list=train_dataset.prompt_list)
@@ -414,6 +547,11 @@ def train_with_config(args, opts):
         chk_filename = opts.evaluate if opts.evaluate else opts.resume
         print('Loading checkpoint', chk_filename)
         checkpoint = torch.load(chk_filename, map_location=lambda storage, loc: storage)
+        validate_checkpoint_training_identity(
+            checkpoint,
+            training_identity,
+            strict=bool(args.get('strict_training_identity', False)),
+        )
         model_backbone.load_state_dict(checkpoint['model_pos'], strict=True)
     model_pos = model_backbone
 
@@ -432,11 +570,14 @@ def train_with_config(args, opts):
             else:
                 print('WARNING: this checkpoint does not contain an optimizer state. The optimizer will be reinitialized.')
             lr = checkpoint['lr']
-            if 'min_loss' in checkpoint and checkpoint['min_loss'] is not None:
-                if 'PE' in eval_dict.keys():
-                    eval_dict['PE']['min_err'] = checkpoint['min_loss']
-                else:
-                    eval_dict[list(eval_dict.keys())[0]]['min_err'] = checkpoint['min_loss']
+            if checkpoint.get('evaluation_state') is not None:
+                checkpoint_eval = checkpoint['evaluation_state']
+                if set(checkpoint_eval) != set(eval_dict):
+                    raise ValueError('checkpoint evaluation state task mismatch')
+                eval_dict = checkpoint_eval
+            elif 'min_loss' in checkpoint and checkpoint['min_loss'] is not None:
+                eval_dict[primary_task]['min_err'] = checkpoint['min_loss']
+            restore_rng_state(checkpoint.get('rng_state'))
 
         # Print global multitask results throughout training
         summary_table = prettytable.PrettyTable()
@@ -484,24 +625,29 @@ def train_with_config(args, opts):
             else:
                 if epoch in epoch_to_eval:
                     epoch_eval_results = {}
+                    epoch_selection_scores = {}
                     if 'PE' in args.tasks:
                         e1, e2, summary_table_PE = evaluate_pose_estimation(args, model_pos, dataloader_dict['PE'], datareader_pose_estimation, epoch=epoch)
                         epoch_eval_results['PE e1'] = e1; epoch_eval_results['PE e2'] = e2
+                        epoch_selection_scores['PE'] = e1
                         train_writer.add_scalar('PE Error P1', e1, epoch + 1)
                         train_writer.add_scalar('PE Error P2', e2, epoch + 1)
                     if 'FPE' in args.tasks:
                         e1FPE, summary_table_FPE = evaluate_future_pose_estimation(args, dataloader_dict['FPE'], model_pos, epoch=epoch)
                         epoch_eval_results['FPE'] = e1FPE
+                        epoch_selection_scores['FPE'] = e1FPE
                         train_writer.add_scalar('FPE MPJPE', e1FPE, epoch + 1)
 
                     if 'MP' in args.tasks:
                         mpjpe, summary_table_MP = evaluate_motion_prediction(args, dataloader_dict['MP'], model_pos, epoch=epoch)
                         epoch_eval_results['MP'] = mpjpe
+                        epoch_selection_scores['MP'] = mpjpe
                         train_writer.add_scalar('MP MPJPE', mpjpe, epoch + 1)
 
                     if 'MC' in args.tasks:
                         min_err_mc, summary_table_MC = evaluate_motion_completion(args, dataloader_dict['MC'], model_pos, epoch=epoch)
                         epoch_eval_results['MC'] = min_err_mc
+                        epoch_selection_scores['MC'] = min_err_mc
                         train_writer.add_scalar('MC MPJPE', min_err_mc, epoch + 1)
 
                     summary_table.add_row([epoch+1] + [epoch_eval_results[metric] for task in args.tasks for metric in args.task_metrics[task]])
@@ -514,37 +660,25 @@ def train_with_config(args, opts):
             chk_path_latest = os.path.join(opts.checkpoint, 'latest_epoch.bin')
             chk_path_best = {task: os.path.join(opts.checkpoint, f'best_epoch_{task}.bin') for task in args.tasks}
             chk_path_best['all'] = os.path.join(opts.checkpoint, 'best_epoch_all.bin')
-
-            save_checkpoint(chk_path_latest, epoch, lr, optimizer, model_pos, eval_dict['PE']['min_err'])
+            improved_tasks = []
+            global_improved = False
 
             # Save best checkpoint according to global best 
             if not args.no_eval:
                 if epoch in epoch_to_eval:
-                    if 'PE' in args.tasks and e1 < eval_dict['PE']['min_err']:
-                        eval_dict['PE']['min_err'] = e1
-                        eval_dict['PE']['best_epoch'] = epoch + 1
-                        save_checkpoint(chk_path_best['PE'], epoch, lr, optimizer, model_pos, eval_dict['PE']['min_err'])
-                        
-                    if 'MP' in args.tasks and mpjpe < eval_dict['MP']['min_err']:
-                        eval_dict['MP']['min_err'] = mpjpe
-                        eval_dict['MP']['best_epoch'] = epoch + 1
-                        save_checkpoint(chk_path_best['MP'], epoch, lr, optimizer, model_pos, eval_dict['MP']['min_err'])
-                    
-                    if 'FPE' in args.tasks and e1FPE < eval_dict['FPE']['min_err']:
-                        eval_dict['FPE']['min_err'] = e1FPE
-                        eval_dict['FPE']['best_epoch'] = epoch + 1
-                        save_checkpoint(chk_path_best['FPE'], epoch, lr, optimizer, model_pos, eval_dict['FPE']['min_err'])
-                    
-                    if 'MC' in args.tasks and min_err_mc < eval_dict['MC']['min_err']:
-                        eval_dict['MC']['min_err'] = min_err_mc
-                        eval_dict['MC']['best_epoch'] = epoch + 1
-                        save_checkpoint(chk_path_best['MC'], epoch, lr, optimizer, model_pos, eval_dict['MC']['min_err'])
+                    active_scores, global_score = summarize_active_task_scores(
+                        args.tasks, epoch_selection_scores
+                    )
+                    for task, score in active_scores.items():
+                        if score < eval_dict[task]['min_err']:
+                            eval_dict[task]['min_err'] = score
+                            eval_dict[task]['best_epoch'] = epoch + 1
+                            improved_tasks.append((task, score))
 
-                    if (e1 + mpjpe + e1FPE + min_err_mc) / 4 < eval_dict['all']['min_err']:
-                        eval_dict['all']['min_err'] = (e1 + mpjpe + e1FPE + min_err_mc) / 4
+                    if global_score < eval_dict['all']['min_err']:
+                        eval_dict['all']['min_err'] = global_score
                         eval_dict['all']['best_epoch'] = epoch + 1
-                        save_checkpoint(chk_path_best['all'], epoch, lr, optimizer, model_pos, eval_dict['all']['min_err'])
-
+                        global_improved = True
 
                     # Print evaluation results
                     if 'PE' in args.tasks:
@@ -563,6 +697,30 @@ def train_with_config(args, opts):
             lr *= lr_decay
             for param_group in optimizer.param_groups:
                 param_group['lr'] *= lr_decay
+            checkpoint_rng_state = capture_rng_state()
+            for task, score in improved_tasks:
+                save_checkpoint(
+                    chk_path_best[task], epoch, lr, optimizer,
+                    model_pos, score,
+                    evaluation_state=eval_dict,
+                    training_identity=training_identity,
+                    rng_state=checkpoint_rng_state,
+                )
+            if global_improved:
+                save_checkpoint(
+                    chk_path_best['all'], epoch, lr, optimizer,
+                    model_pos, eval_dict['all']['min_err'],
+                    evaluation_state=eval_dict,
+                    training_identity=training_identity,
+                    rng_state=checkpoint_rng_state,
+                )
+            save_checkpoint(
+                chk_path_latest, epoch, lr, optimizer, model_pos,
+                eval_dict[primary_task]['min_err'],
+                evaluation_state=eval_dict,
+                training_identity=training_identity,
+                rng_state=checkpoint_rng_state,
+            )
         
         print(f"Training took {(time() - training_start_time) / 3600 :.2f}h")
 
@@ -592,6 +750,7 @@ def train_with_config(args, opts):
 
 if __name__ == "__main__":
     opts = parse_args()
-    set_random_seed(opts.seed)
     args = get_config(opts.config)
+    opts.seed = int(args.get('seed', opts.seed))
+    set_random_seed(opts.seed)
     train_with_config(args, opts)
